@@ -1,6 +1,6 @@
 # Biliver
 
-Biliver 是一个专为 MPV 播放器设计的 **高性能 Bilibili 弹幕** 优化插件。
+Biliver 是一个专为 MPV 播放器设计的 **高性能 Bilibili 弹幕** 插件。
 
 它致力于解决MPV无法显示Bilibili弹幕的问题，通过 Python 异步后端与 60fps 补帧技术，在 MPV 上实现比网页端更丝滑、更纯净的弹幕体验。
 
