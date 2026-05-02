@@ -199,14 +199,27 @@ async function getLiveStreamUrl(pageUrl) {
 
 // ===================== MPV 指令构建 =====================
 function buildMpvCommand(media) {
+    // 构建 HTTP 头列表（避免值中包含逗号，防止 MPV 解析错误）
+    const headers = [];
+    if (media.origin) headers.push(`Origin: ${media.origin}`);
+    if (media.referer) headers.push(`Referer: ${media.referer}`);
+    if (media.cookie) headers.push(`Cookie: ${media.cookie}`);
+    if (media.userAgent) headers.push(`User-Agent: ${media.userAgent}`);
+
+    // 添加额外的头以避免 403/400
+    headers.push('Accept: */*');
+    headers.push('Accept-Language: zh-CN');
+    headers.push('Connection: keep-alive');
+
     const args = [
         'mpv',
         `"${media.video}"`,
         media.audio ? `--audio-file="${media.audio}"` : '',
-        media.origin ? `--http-header-fields="Origin: ${media.origin}"` : '',
-        media.referer ? `--http-header-fields="Referer: ${media.referer}"` : '',
-        media.cookie ? `--http-header-fields="Cookie: ${media.cookie}"` : '',
-        media.userAgent ? `--user-agent="${media.userAgent}"` : '',
+        headers.length > 0 ? `--http-header-fields="${headers.join(',')}"` : '',
+        // 禁用 yt-dlp/youtube-dl 钩子（我们已经有直链）
+        '--ytdl=no',
+        // 跳过 SSL 验证（解决证书不匹配问题）
+        '--tls-verify=no',
         media.cid ? `--script-opts-append="cid=${media.cid}"` : '',
         '--script-opts-append="biliver_enabled=yes"',
         media.roomid ? `--script-opts-append=biliver_room_id=${media.roomid}` : '',
