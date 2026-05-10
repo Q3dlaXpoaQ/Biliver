@@ -105,7 +105,17 @@ local danmu_list = {}
 local danmu_ov = nil
 local danmu_timer = nil
 
--- Update danmaku positions and render to OSD
+
+
+-- 检查弹幕是否超出屏幕左边界（简化检测）
+local function is_danmaku_out_of_bounds(dm, x)
+    -- 简化检测：假设弹幕文本宽度为屏幕宽度的1/6
+    -- 这是一个估算值，可以根据需要调整
+    local estimated_text_width = 1920 / 6  -- 约320像素
+    return x + estimated_text_width < 0
+end
+
+-- Update danmaku positions and render to OSD（简化版，优先边界检测）
 local function update_danmaku()
     local now = mp.get_time()
     local ass_table = {}
@@ -114,11 +124,16 @@ local function update_danmaku()
     for i = #danmu_list, 1, -1 do
         local dm = danmu_list[i]
         local elapsed = now - dm.start_time
-        if elapsed >= o.duration then
+        local x = 1920 - (1920 + 1200) * (elapsed / o.duration)
+        
+        -- 优先检查边界，弹幕离开屏幕立即清理
+        if is_danmaku_out_of_bounds(dm, x) then
+            table.remove(danmu_list, i)
+        -- 备用超时机制，防止极端情况
+        elseif elapsed >= o.duration * 1.5 then  -- 增加50%缓冲时间
             table.remove(danmu_list, i)
         else
             has_active = true
-            local x = 1920 - (1920 + 1200) * (elapsed / o.duration)
             -- 干净样式：无描边无阴影
             table.insert(ass_table, string.format("{\\an7\\fn%s\\fs%d\\c%s\\alpha&H%s&\\bord0\\shad0\\b1\\pos(%.1f,%d)}%s", 
                 o.fontname, o.font_size, dm.color, ass_alpha, x, dm.y, dm.text))

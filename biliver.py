@@ -245,6 +245,14 @@ class DanmakuManager:
         self.travel = w + 1200
         # 与 Lua 端统一速度：travel / duration
         self.v = self.travel / self.dur
+    
+    def cleanup_tracks(self):
+        """清理过期的轨道时间戳，防止内存泄漏"""
+        now = time.monotonic()
+        # 清理超过显示时间2倍的过期条目
+        expired_threshold = now - (self.dur * 2)
+        self.tracks = {k: v for k, v in self.tracks.items() if v > expired_threshold}
+        # logger.debug(f"清理过期轨道，当前轨道数: {len(self.tracks)}")
 
     def find_track(self, text, now=None):
         if now is None:
@@ -253,11 +261,17 @@ class DanmakuManager:
         tw = sum(0.6 if ord(c) < 128 else 1.05 for c in text) * self.fs
 
         # 寻找首个完全空闲的轨道
+        available_tracks = []
         for i in range(self.max_t):
             if now >= self.tracks.get(i, 0):
-                # 记录尾部离开屏幕右边缘的时间
-                self.tracks[i] = now + (tw / self.v) + 0.2
-                return i
+                available_tracks.append(i)
+        
+        if available_tracks:
+            # 稀疏时优先最顶部轨道，密集时自动向下分配
+            selected_track = available_tracks[0]
+            # 记录尾部离开屏幕右边缘的时间
+            self.tracks[selected_track] = now + (tw / self.v) + 0.2
+            return selected_track
 
         # 如果全部轨道都有弹幕，寻找最快空出的轨道（减少重叠感）
         oldest = min(range(self.max_t), key=lambda i: self.tracks.get(i, 0))
@@ -275,6 +289,19 @@ def _write_ipc(path, cmd):
         return True
     except OSError as e:
         logger.error(f"IPC 写入线程异常: {e}")
+        return False
+
+
+def _check_ipc_connection(ipc_path):
+    """检测IPC连接是否正常"""
+    try:
+        # 尝试写入测试数据
+        test_data = json.dumps({"test": "connection"}) + "\n"
+        with open(ipc_path, "w", encoding="utf-8") as f:
+            f.write(test_data)
+            f.flush()
+        return True
+    except (OSError, IOError):
         return False
 
 
@@ -296,7 +323,21 @@ async def ipc_worker(queue, path):
             queue.task_done()
 
 
+def cleanup_queue(queue):
+    """清理队列中最旧的部分消息，防止队列积压（简化版）"""
+    if queue.qsize() > 150:
+        # 清理约30%的最旧消息
+        cleanup_size = max(15, int(queue.qsize() * 0.3))
+        for _ in range(cleanup_size):
+            queue.get_nowait()
+        logger.warning(f"清理了 {cleanup_size} 条旧消息，当前队列大小: {queue.qsize()}")
+
 def send_mpv_async(queue, cmd):
+    # 简化队列管理，只在接近满载时清理
+    if queue.qsize() >= 180:
+        logger.warning("IPC队列接近满载，执行清理")
+        cleanup_queue(queue)
+    
     if queue.qsize() < 200:
         queue.put_nowait(cmd)
     else:
@@ -434,10 +475,44 @@ def run_vod(target_id, directory, size_str, font, fontsize, opacity_pct, area, d
         logger.error(f"点播转换失败: {traceback.format_exc()}")
 
 
+async def connection_monitor(ipc_path, timeout_seconds=7):
+    """监控IPC连接状态，如果连接断开超过指定时间则自动退出"""
+    logger.info(f"启动连接监控，超时时间: {timeout_seconds}秒")
+    while True:
+        try:
+            if not _check_ipc_connection(ipc_path):
+                logger.warning("IPC连接已断开")
+                await asyncio.sleep(timeout_seconds)
+                if not _check_ipc_connection(ipc_path):
+                    logger.error(f"IPC连接长时间断开({timeout_seconds}秒)，自动终止")
+                    os._exit(1)  # 强制退出
+            await asyncio.sleep(2)  # 每2秒检测一次连接状态
+        except Exception as e:
+            logger.error(f"连接监控异常: {e}")
+            break
+
+
+async def cleanup_task(dm_manager, ipc_queue, interval=60):
+    """定期清理队列数据（简化版，移除tracks清理）"""
+    while True:
+        await asyncio.sleep(interval)
+        # 只清理队列，移除tracks清理以简化逻辑
+        if ipc_queue.qsize() > 50:
+            logger.warning(f"定期清理：队列大小 {ipc_queue.qsize()}")
+            cleanup_queue(ipc_queue)
+        logger.debug("执行定期队列清理")
+
+
 async def run_live(room_id, ipc_path, area, fs, duration=10.0):
     dm = DanmakuManager(area=area, fs=fs, dur=duration)
     ipc_queue = asyncio.Queue()
     worker_task = asyncio.create_task(ipc_worker(ipc_queue, ipc_path))
+    
+    # 启动连接监控任务
+    monitor_task = asyncio.create_task(connection_monitor(ipc_path))
+    
+    # 启动定期清理任务
+    cleanup_task_obj = asyncio.create_task(cleanup_task(dm, ipc_queue))
 
     # 用于优雅关闭
     shutdown_event = asyncio.Event()
@@ -485,6 +560,15 @@ async def run_live(room_id, ipc_path, area, fs, duration=10.0):
                     except asyncio.TimeoutError:
                         pass
     finally:
+        # 清理时取消所有任务
+        monitor_task.cancel()
+        cleanup_task_obj.cancel()
+        try:
+            await monitor_task
+            await cleanup_task_obj
+        except asyncio.CancelledError:
+            pass
+        
         worker_task.cancel()
         try:
             await worker_task
