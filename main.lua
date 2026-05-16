@@ -29,8 +29,6 @@ end
 
 local ass_alpha = get_ass_alpha(o.opacity)
 
-local TRAVEL = 1920 + 1200  -- total travel distance: screen width + max text width
-
 local backend_process = nil
 local danmu_file = nil
 
@@ -56,7 +54,9 @@ local function safe_remove_fps_vf()
     if not filters then return end
     for _, f in ipairs(filters) do
         if f.label == "Biliver-FPS" then
-            mp.commandv('vf', 'remove', '@Biliver-FPS')
+            pcall(function()
+                mp.commandv('vf', 'remove', '@Biliver-FPS')
+            end)
             return true
         end
     end
@@ -112,85 +112,155 @@ local function update_fps_vf(force)
     end
 end
 
--- Live danmaku ASS subtitle track (same native render path as VOD)
-local live_ass_path = nil
-local live_ass_track = nil
-local reload_scheduled = false
+-- Live danmaku rendering (OSD overlay, zero flicker, 60fps)
+local TOP_MARGIN = 10
+local travel_dist = 1920 + 1200
+
+local overlay = nil
+local dm_pool = {}
+local render_timer = nil
+local render_running = false
 local saved_msg_level = nil
 local danmaku_visible = true
-local LIVE_ASS_HEADER = string.format(
-    "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginV, Encoding\nStyle: Default, %s, %d, &H%sFFFFFF, &H00000000, &H00000000, 1, 1, 0, 0, 7, 0, 1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-    o.fontname, o.font_size, ass_alpha
-)
+local live_w, live_h = 1920, 1080
+local danmaku_speed = travel_dist / o.duration
+local track_height = o.font_size + 8
+local max_tracks = math.max(1, math.floor((1080 * o.area) / track_height))
+local track_until = {}
 
-local function ts(x)
-    return string.format("%d:%02d:%02d.%02d",
-        math.floor(x / 3600),
-        math.floor((x % 3600) / 60),
-        math.floor(x % 60),
-        math.floor((x * 100) % 100))
+local function sanitize_text(text)
+    return text:gsub("[{}]", ""):gsub("\n", " ")
 end
 
-local function init_live_ass()
-    live_ass_path = utils.join_path(os.getenv("TEMP") or "/tmp/", "biliver_live.ass")
-    live_ass_track = nil
-    reload_scheduled = false
-    local f = io.open(live_ass_path, "w")
-    f:write(LIVE_ASS_HEADER)
-    f:close()
+local function estimate_text_width(text)
+    local w = 0
+    for i = 1, #text do
+        local c = text:sub(i, i)
+        w = w + (c:byte() < 128 and 0.6 or 1.05)
+    end
+    return w * o.font_size
 end
 
-local function find_live_ass_track()
-    local tracks = mp.get_property_native("track-list") or {}
-    for _, t in ipairs(tracks) do
-        if t.type == "sub" and t.external and (t.title == "Biliver Live") then
-            return t.id
+local function pick_track(text_width)
+    local now = mp.get_time()
+    local travel_time = text_width / danmaku_speed + 0.2
+    for i = 1, max_tracks do
+        if now >= (track_until[i] or 0) then
+            track_until[i] = now + travel_time
+            return i, now
         end
     end
-    return nil
+    local best = 1
+    for i = 2, max_tracks do
+        if (track_until[i] or 0) < (track_until[best] or 0) then
+            best = i
+        end
+    end
+    local effective_start = (track_until[best] or now)
+    track_until[best] = effective_start + travel_time
+    return best, effective_start
 end
 
-local function load_or_reload_ass()
-    reload_scheduled = false
-    if live_ass_track then
-        pcall(function()
-            mp.commandv("sub-reload", live_ass_track)
-        end)
-    else
-        pcall(function()
-            mp.commandv("sub-add", live_ass_path, "select", "Biliver Live")
-        end)
-        live_ass_track = find_live_ass_track()
+local function render_frame()
+    render_timer = nil
+    render_running = false
+    if not danmaku_visible or not overlay then return end
+
+    local now = mp.get_time()
+    local alive = {}
+    for _, dm in ipairs(dm_pool) do
+        if now - dm.born < dm.lifespan then
+            alive[#alive + 1] = dm
+        end
+    end
+    dm_pool = alive
+
+    if #dm_pool == 0 then
+        overlay.data = ""
+        overlay:update()
+        return
+    end
+
+    local lines = {}
+    for _, dm in ipairs(dm_pool) do
+        local elapsed = now - dm.born
+        if elapsed < 0 then elapsed = 0 end
+        if elapsed > dm.lifespan then elapsed = dm.lifespan end
+        local x = dm.start_x - danmaku_speed * elapsed
+        if x < dm.end_x then x = dm.end_x end
+        lines[#lines + 1] = string.format(
+            "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\fs%d\\fn%s\\alpha&H%s&}%s",
+            x, dm.y, dm.color, o.font_size, o.fontname, ass_alpha, dm.text
+        )
+    end
+
+    overlay.data = table.concat(lines, "\n")
+    overlay:update()
+
+    if #dm_pool > 0 then
+        render_running = true
+        render_timer = mp.add_timeout(0, render_frame)
     end
 end
 
-local function add_danmaku(color, text, y)
-    text = text:gsub("{", ""):gsub("}", ""):gsub("\n", " ")
-    y = tonumber(y) or 40
+local function start_render()
+    if render_running then return end
+    if not danmaku_visible or not overlay then return end
+    if #dm_pool == 0 then return end
+    render_running = true
+    render_timer = mp.add_timeout(0, render_frame)
+end
 
-    local video_time = mp.get_property_number("time-pos") or 0
+local function add_danmaku(color, text, y_hint)
+    text = sanitize_text(text)
+    if text == "" then return end
 
-    -- 按轨道错开 Start 时间，避免同批弹幕同时从右侧涌入
-    local TOP_MARGIN = 10  -- 必须与 biliver.py run_live 的 top_margin 一致
-    local th = o.font_size + 8
-    local track_idx = math.max(0, math.floor((y - TOP_MARGIN) / th))
-    local stagger = track_idx * 0.10  -- 每条轨道延迟 0.1 秒
-    local start_time = video_time + stagger
-    local end_time = start_time + o.duration
+    local tw = estimate_text_width(text)
+    local track, effective_start = pick_track(tw)
+    local y_pos = TOP_MARGIN + (track - 1) * track_height
 
-    local f = io.open(live_ass_path, "a")
-    f:write(string.format(
-        "Dialogue: 0,%s,%s,Default,,0,0,0,,{\\move(1920,%d,%d,%d)\\c%s\\alpha&H%s&}%s\n",
-        ts(start_time), ts(end_time),
-        y, -1200, y,
-        color, ass_alpha, text
-    ))
-    f:close()
+    dm_pool[#dm_pool + 1] = {
+        text = text,
+        color = color,
+        y = y_pos,
+        born = effective_start,
+        lifespan = o.duration,
+        start_x = live_w,
+        end_x = -(travel_dist - live_w),
+    }
 
-    if not reload_scheduled then
-        reload_scheduled = true
-        mp.add_timeout(0.1, load_or_reload_ass)
+    start_render()
+end
+
+local function init_live_osd()
+    if overlay then
+        overlay:remove()
     end
+
+    local vo_params = mp.get_property_native('video-out-params')
+    if vo_params then
+        live_w = vo_params.dw or vo_params.w or 1920
+        live_h = vo_params.dh or vo_params.h or 1080
+    end
+
+    travel_dist = live_w + 1200
+    danmaku_speed = travel_dist / o.duration
+    track_height = o.font_size + 8
+    max_tracks = math.max(1, math.floor((live_h * o.area) / track_height))
+    track_until = {}
+    dm_pool = {}
+
+    if render_timer then
+        render_timer:kill()
+        render_timer = nil
+    end
+    render_running = false
+
+    overlay = mp.create_osd_overlay("ass-events")
+    overlay.res_x = live_w
+    overlay.res_y = live_h
+    overlay.data = ""
+    overlay:update()
 end
 
 mp.register_script_message("biliver-danmaku", add_danmaku)
@@ -205,9 +275,12 @@ local function process_vod(target_id)
     local py_path = utils.join_path(script_dir, "biliver.py")
     local danmaku_dir = os.getenv("TEMP") or "/tmp/"
     
+    local vo_params = mp.get_property_native('video-out-params')
     local dw, dh = 1920, 1080
-    local aspect = mp.get_property_number('width', 16) / mp.get_property_number('height', 9)
-    if aspect > dw / dh then dh = math.floor(dw / aspect) else dw = math.floor(dh * aspect) end
+    if vo_params then
+        dw = vo_params.dw or vo_params.w or 1920
+        dh = vo_params.dh or vo_params.h or 1080
+    end
 
     mp.command_native_async({
         name = 'subprocess',
@@ -276,18 +349,17 @@ local function on_start_file()
     if room_id then
         msg.info("Bilibili Live detected: " .. room_id)
         mp.osd_message("Biliver: 正在连接直播弹幕 " .. room_id, 2)
-        -- 抑制 sub-add/sub-reload 的控制台刷屏 (Track added:/Reloaded:)
         pcall(function()
             saved_msg_level = mp.get_property("msg-level")
             mp.set_property("msg-level", "player=warn")
         end)
-        init_live_ass()
+        init_live_osd()
         update_fps_vf(true)
         local script_dir = mp.get_script_directory() or "."
         local backend_path = utils.join_path(script_dir, "biliver.py")
         backend_process = mp.command_native_async({
             name = "subprocess",
-            args = {o.python_path, backend_path, "live", tostring(room_id), ipc_server, tostring(o.area), tostring(o.font_size), tostring(o.duration)},
+            args = {o.python_path, backend_path, "live", tostring(room_id), ipc_server, tostring(o.area), tostring(o.font_size), tostring(o.duration), "--width", tostring(live_w), "--height", tostring(live_h)},
             playback_only = false,
         }, function(success, res, err)
             -- subprocess 被 abort 时 success=false 且 res.killed_by_us=true，这是正常行为
@@ -335,10 +407,16 @@ mp.register_event("end-file", function(e)
             os.remove(danmu_file)
             danmu_file = nil
         end
-        if live_ass_path and utils.file_info(live_ass_path) then
-            os.remove(live_ass_path)
-            live_ass_path = nil
+        if overlay then
+            overlay:remove()
+            overlay = nil
         end
+        if render_timer then
+            render_timer:kill()
+            render_timer = nil
+        end
+        render_running = false
+        dm_pool = {}
         -- 恢复 msg-level
         pcall(function()
             if saved_msg_level then
@@ -358,7 +436,18 @@ mp.observe_property("container-fps", nil, update_fps_vf)
 -- Danmaku toggle
 local function toggle_danmaku()
     danmaku_visible = not danmaku_visible
-    mp.set_property_bool("sub-visibility", danmaku_visible)
+    if danmaku_visible then
+        if overlay then
+            overlay.hidden = false
+            overlay:update()
+        end
+        start_render()
+    else
+        if overlay then
+            overlay.hidden = true
+            overlay:update()
+        end
+    end
     mp.osd_message(danmaku_visible and "弹幕: 开启" or "弹幕: 关闭", 1.5)
 end
 

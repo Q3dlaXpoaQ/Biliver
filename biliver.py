@@ -485,7 +485,7 @@ async def connection_monitor(ipc_path, timeout_seconds=7):
                 await asyncio.sleep(timeout_seconds)
                 if not _check_ipc_connection(ipc_path):
                     logger.error(f"IPC连接长时间断开({timeout_seconds}秒)，自动终止")
-                    os._exit(1)  # 强制退出
+                    sys.exit(1)
             await asyncio.sleep(2)  # 每2秒检测一次连接状态
         except Exception as e:
             logger.error(f"连接监控异常: {e}")
@@ -493,18 +493,18 @@ async def connection_monitor(ipc_path, timeout_seconds=7):
 
 
 async def cleanup_task(dm_manager, ipc_queue, interval=60):
-    """定期清理队列数据（简化版，移除tracks清理）"""
+    """定期清理队列数据和过期轨道"""
     while True:
         await asyncio.sleep(interval)
-        # 只清理队列，移除tracks清理以简化逻辑
+        dm_manager.cleanup_tracks()
         if ipc_queue.qsize() > 50:
             logger.warning(f"定期清理：队列大小 {ipc_queue.qsize()}")
             cleanup_queue(ipc_queue)
-        logger.debug("执行定期队列清理")
+        logger.debug("执行定期清理")
 
 
-async def run_live(room_id, ipc_path, area, fs, duration=10.0):
-    dm = DanmakuManager(area=area, fs=fs, dur=duration)
+async def run_live(room_id, ipc_path, area, fs, duration=10.0, w=1920, h=1080):
+    dm = DanmakuManager(w=w, h=h, area=area, fs=fs, dur=duration)
     top_margin = int(dm.h * 0.01)  # ~10px for 1080p PlayResY
     ipc_queue = asyncio.Queue()
     worker_task = asyncio.create_task(ipc_worker(ipc_queue, ipc_path))
@@ -608,6 +608,8 @@ if __name__ == "__main__":
     live_parser.add_argument("area", type=float, help="显示区域比例")
     live_parser.add_argument("fontsize", type=float, help="字体大小")
     live_parser.add_argument("duration", type=float, help="弹幕滚动时长（秒）")
+    live_parser.add_argument("--width", type=int, default=1920, help="视频宽度")
+    live_parser.add_argument("--height", type=int, default=1080, help="视频高度")
 
     args = parser.parse_args()
 
@@ -624,7 +626,7 @@ if __name__ == "__main__":
         )
     elif args.mode == "live":
         try:
-            asyncio.run(run_live(args.room_id, args.ipc_path, args.area, args.fontsize, args.duration))
+            asyncio.run(run_live(args.room_id, args.ipc_path, args.area, args.fontsize, args.duration, args.width, args.height))
         except KeyboardInterrupt:
             logger.info("用户中断")
     else:
