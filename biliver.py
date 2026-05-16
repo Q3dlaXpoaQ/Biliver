@@ -505,6 +505,7 @@ async def cleanup_task(dm_manager, ipc_queue, interval=60):
 
 async def run_live(room_id, ipc_path, area, fs, duration=10.0):
     dm = DanmakuManager(area=area, fs=fs, dur=duration)
+    top_margin = int(dm.h * 0.01)  # ~10px for 1080p PlayResY
     ipc_queue = asyncio.Queue()
     worker_task = asyncio.create_task(ipc_worker(ipc_queue, ipc_path))
     
@@ -540,7 +541,7 @@ async def run_live(room_id, ipc_path, area, fs, duration=10.0):
                             "biliver-danmaku",
                             f"&H{i[0][3] & 0xFF:02x}{(i[0][3] >> 8) & 0xFF:02x}{(i[0][3] >> 16) & 0xFF:02x}&",
                             i[1],
-                            str(40 + dm.find_track(i[1]) * dm.th),
+                            str(top_margin + dm.find_track(i[1]) * dm.th),
                         ],
                     )
                     await client.run()

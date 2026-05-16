@@ -29,6 +29,8 @@ end
 
 local ass_alpha = get_ass_alpha(o.opacity)
 
+local TRAVEL = 1920 + 1200  -- total travel distance: screen width + max text width
+
 local backend_process = nil
 local danmu_file = nil
 
@@ -62,15 +64,9 @@ local function safe_remove_fps_vf()
 end
 
 -- 帧率优化滤镜：确保弹幕始终以 60fps 渲染
-local function update_fps_vf()
+local function update_fps_vf(force)
     if not o.fps_vf then return end
-    local video_fps = mp.get_property_number("container-fps")
-    local video_speed = mp.get_property_number("speed", 1)
     
-    -- container-fps 尚未可用（视频还未加载完成）
-    if not video_fps then return end
-    
-    -- 检查滤镜是否存在
     local filters = mp.get_property_native("vf")
     local has_filter = false
     if filters then
@@ -78,6 +74,22 @@ local function update_fps_vf()
             if f.label == "Biliver-FPS" then has_filter = true break end
         end
     end
+
+    -- 直播模式：强制添加补帧滤镜，不等待 container-fps
+    if force then
+        if not has_filter then
+            pcall(function()
+                mp.commandv('vf', 'append', '@Biliver-FPS:fps=fps=60:round=near')
+            end)
+        end
+        return
+    end
+
+    local video_fps = mp.get_property_number("container-fps")
+    local video_speed = mp.get_property_number("speed", 1)
+    
+    -- container-fps 尚未可用（视频还未加载完成）
+    if not video_fps then return end
 
     -- 低于 59fps 的视频补帧到 60fps（涵盖 24/25/30/50fps）
     -- 倍速 >= 2x 时移除滤镜避免性能问题
@@ -100,85 +112,84 @@ local function update_fps_vf()
     end
 end
 
--- Danmaku Management State
-local danmu_list = {}
-local danmu_ov = nil
-local danmu_timer = nil
+-- Live danmaku ASS subtitle track (same native render path as VOD)
+local live_ass_path = nil
+local live_ass_track = nil
+local reload_scheduled = false
+local saved_msg_level = nil
+local danmaku_visible = true
+local LIVE_ASS_HEADER = string.format(
+    "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginV, Encoding\nStyle: Default, %s, %d, &H%sFFFFFF, &H00000000, &H00000000, 1, 1, 0, 0, 7, 0, 1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+    o.fontname, o.font_size, ass_alpha
+)
 
-
-
--- 检查弹幕是否超出屏幕左边界（简化检测）
-local function is_danmaku_out_of_bounds(dm, x)
-    -- 简化检测：假设弹幕文本宽度为屏幕宽度的1/6
-    -- 这是一个估算值，可以根据需要调整
-    local estimated_text_width = 1920 / 6  -- 约320像素
-    return x + estimated_text_width < 0
+local function ts(x)
+    return string.format("%d:%02d:%02d.%02d",
+        math.floor(x / 3600),
+        math.floor((x % 3600) / 60),
+        math.floor(x % 60),
+        math.floor((x * 100) % 100))
 end
 
--- Update danmaku positions and render to OSD（简化版，优先边界检测）
-local function update_danmaku()
-    local now = mp.get_time()
-    local ass_table = {}
-    local has_active = false
-    
-    for i = #danmu_list, 1, -1 do
-        local dm = danmu_list[i]
-        local elapsed = now - dm.start_time
-        local x = 1920 - (1920 + 1200) * (elapsed / o.duration)
-        
-        -- 优先检查边界，弹幕离开屏幕立即清理
-        if is_danmaku_out_of_bounds(dm, x) then
-            table.remove(danmu_list, i)
-        -- 备用超时机制，防止极端情况
-        elseif elapsed >= o.duration * 1.5 then  -- 增加50%缓冲时间
-            table.remove(danmu_list, i)
-        else
-            has_active = true
-            -- 干净样式：无描边无阴影
-            table.insert(ass_table, string.format("{\\an7\\fn%s\\fs%d\\c%s\\alpha&H%s&\\bord0\\shad0\\b1\\pos(%.1f,%d)}%s", 
-                o.fontname, o.font_size, dm.color, ass_alpha, x, dm.y, dm.text))
+local function init_live_ass()
+    live_ass_path = utils.join_path(os.getenv("TEMP") or "/tmp/", "biliver_live.ass")
+    live_ass_track = nil
+    reload_scheduled = false
+    local f = io.open(live_ass_path, "w")
+    f:write(LIVE_ASS_HEADER)
+    f:close()
+end
+
+local function find_live_ass_track()
+    local tracks = mp.get_property_native("track-list") or {}
+    for _, t in ipairs(tracks) do
+        if t.type == "sub" and t.external and (t.title == "Biliver Live") then
+            return t.id
         end
     end
-    
-    if has_active then
-        if not danmu_ov then
-            msg.verbose("Creating OSD overlay")
-            danmu_ov = mp.create_osd_overlay("ass-events")
-            danmu_ov.res_x = 1920
-            danmu_ov.res_y = 1080
-            danmu_ov.z = 999
-        end
-        danmu_ov.data = table.concat(ass_table, "\n")
-        danmu_ov:update()
+    return nil
+end
+
+local function load_or_reload_ass()
+    reload_scheduled = false
+    if live_ass_track then
+        pcall(function()
+            mp.commandv("sub-reload", live_ass_track)
+        end)
     else
-        if danmu_ov then
-            msg.verbose("Removing OSD overlay (no active danmaku)")
-            danmu_ov:remove()
-            danmu_ov = nil
-        end
-        if danmu_timer then
-            msg.verbose("Stopping timer")
-            danmu_timer:stop()
-            danmu_timer = nil
-        end
+        pcall(function()
+            mp.commandv("sub-add", live_ass_path, "select", "Biliver Live")
+        end)
+        live_ass_track = find_live_ass_track()
     end
 end
 
 local function add_danmaku(color, text, y)
-    -- msg.info("Received: " .. text)
     text = text:gsub("{", ""):gsub("}", ""):gsub("\n", " ")
     y = tonumber(y) or 40
-    
-    table.insert(danmu_list, {
-        color = color,
-        text = text,
-        y = y,
-        start_time = mp.get_time()
-    })
-    
-    if not danmu_timer then
-        msg.verbose("Starting timer")
-        danmu_timer = mp.add_periodic_timer(1/60, update_danmaku)
+
+    local video_time = mp.get_property_number("time-pos") or 0
+
+    -- 按轨道错开 Start 时间，避免同批弹幕同时从右侧涌入
+    local TOP_MARGIN = 10  -- 必须与 biliver.py run_live 的 top_margin 一致
+    local th = o.font_size + 8
+    local track_idx = math.max(0, math.floor((y - TOP_MARGIN) / th))
+    local stagger = track_idx * 0.10  -- 每条轨道延迟 0.1 秒
+    local start_time = video_time + stagger
+    local end_time = start_time + o.duration
+
+    local f = io.open(live_ass_path, "a")
+    f:write(string.format(
+        "Dialogue: 0,%s,%s,Default,,0,0,0,,{\\move(1920,%d,%d,%d)\\c%s\\alpha&H%s&}%s\n",
+        ts(start_time), ts(end_time),
+        y, -1200, y,
+        color, ass_alpha, text
+    ))
+    f:close()
+
+    if not reload_scheduled then
+        reload_scheduled = true
+        mp.add_timeout(0.1, load_or_reload_ass)
     end
 end
 
@@ -265,7 +276,13 @@ local function on_start_file()
     if room_id then
         msg.info("Bilibili Live detected: " .. room_id)
         mp.osd_message("Biliver: 正在连接直播弹幕 " .. room_id, 2)
-        update_fps_vf()
+        -- 抑制 sub-add/sub-reload 的控制台刷屏 (Track added:/Reloaded:)
+        pcall(function()
+            saved_msg_level = mp.get_property("msg-level")
+            mp.set_property("msg-level", "player=warn")
+        end)
+        init_live_ass()
+        update_fps_vf(true)
         local script_dir = mp.get_script_directory() or "."
         local backend_path = utils.join_path(script_dir, "biliver.py")
         backend_process = mp.command_native_async({
@@ -318,12 +335,35 @@ mp.register_event("end-file", function(e)
             os.remove(danmu_file)
             danmu_file = nil
         end
+        if live_ass_path and utils.file_info(live_ass_path) then
+            os.remove(live_ass_path)
+            live_ass_path = nil
+        end
+        -- 恢复 msg-level
+        pcall(function()
+            if saved_msg_level then
+                mp.set_property("msg-level", saved_msg_level)
+            else
+                mp.set_property("msg-level", "")
+            end
+            saved_msg_level = nil
+        end)
     end
 end)
 
 mp.observe_property("speed", nil, update_fps_vf)
 -- 监听 container-fps 变化，确保视频加载完成后能正确应用补帧滤镜
 mp.observe_property("container-fps", nil, update_fps_vf)
+
+-- Danmaku toggle
+local function toggle_danmaku()
+    danmaku_visible = not danmaku_visible
+    mp.set_property_bool("sub-visibility", danmaku_visible)
+    mp.osd_message(danmaku_visible and "弹幕: 开启" or "弹幕: 关闭", 1.5)
+end
+
+mp.add_key_binding("Ctrl+d", "toggle-danmaku", toggle_danmaku)
+mp.register_script_message("biliver-toggle", toggle_danmaku)
 
 
 
