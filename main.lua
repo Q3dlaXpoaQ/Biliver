@@ -31,6 +31,7 @@ local ass_alpha = get_ass_alpha(o.opacity)
 
 local backend_process = nil
 local danmu_file = nil
+local vod_danmaku_loaded = false
 
 -- 获取或设置 IPC Server
 local ipc_server = mp.get_property("input-ipc-server")
@@ -303,6 +304,7 @@ local function process_vod(target_id)
             danmu_file = utils.join_path(danmaku_dir, danmu_filename)
             if utils.file_info(danmu_file) then
                 mp.commandv("sub-add", danmu_file, "select", "Bilibili Danmaku")
+                vod_danmaku_loaded = true
                 update_fps_vf()
                 mp.osd_message("Biliver: 点播弹幕加载完成", 2)
                 msg.info("VOD danmaku loaded and selected.")
@@ -407,6 +409,7 @@ mp.register_event("end-file", function(e)
             os.remove(danmu_file)
             danmu_file = nil
         end
+        vod_danmaku_loaded = false
         if overlay then
             overlay:remove()
             overlay = nil
@@ -435,6 +438,15 @@ mp.observe_property("container-fps", nil, update_fps_vf)
 
 -- Danmaku toggle
 local function toggle_danmaku()
+    -- VOD mode: toggle subtitle visibility
+    if vod_danmaku_loaded then
+        local sub_vis = mp.get_property_bool("sub-visibility")
+        mp.set_property_bool("sub-visibility", not sub_vis)
+        mp.osd_message((not sub_vis) and "弹幕: 开启" or "弹幕: 关闭", 1.5)
+        return
+    end
+    
+    -- Live mode: toggle overlay visibility
     danmaku_visible = not danmaku_visible
     if danmaku_visible then
         if overlay then
@@ -451,7 +463,7 @@ local function toggle_danmaku()
     mp.osd_message(danmaku_visible and "弹幕: 开启" or "弹幕: 关闭", 1.5)
 end
 
-mp.add_key_binding("Ctrl+d", "toggle-danmaku", toggle_danmaku)
+mp.add_forced_key_binding("Ctrl+d", "toggle-danmaku", toggle_danmaku)
 mp.register_script_message("biliver-toggle", toggle_danmaku)
 
 
