@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 #Requires -PSEdition Desktop
 
 [CmdletBinding()]
@@ -168,7 +168,7 @@ function Validate-Path {
 function Copy-PluginFiles {
     param([string]$SrcDir, [string]$MpvDir)
     Write-Step "Copying plugin files..."
-    $scriptsDir    = Join-Path $MpvDir 'scripts'
+    $scriptsDir    = Join-Path $MpvDir 'scripts\biliver'
     $scriptOptsDir = Join-Path $MpvDir 'script-opts'
     foreach ($dir in @($scriptsDir, $scriptOptsDir)) {
         if (-not (Test-Path $dir)) {
@@ -311,8 +311,8 @@ function Show-Completion {
     Write-Success "========================================"
     Write-Host ""
     Write-Host "Installed:" -ForegroundColor White
-    Write-Info "  $(Join-Path $MpvDir 'scripts\main.lua')"
-    Write-Info "  $(Join-Path $MpvDir 'scripts\biliver.py')"
+    Write-Info "  $(Join-Path $MpvDir 'scripts\biliver\main.lua')"
+    Write-Info "  $(Join-Path $MpvDir 'scripts\biliver\biliver.py')"
     Write-Info "  $(Join-Path $MpvDir 'script-opts\biliver.conf')"
     Write-Host ""
     Write-Host "Manual steps required:" -ForegroundColor Yellow
