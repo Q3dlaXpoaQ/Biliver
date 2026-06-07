@@ -190,7 +190,7 @@ local function render_frame()
         local x = dm.start_x - danmaku_speed * elapsed
         if x < dm.end_x then x = dm.end_x end
         lines[#lines + 1] = string.format(
-            "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\fs%d\\fn%s\\alpha&H%s&}%s",
+            "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\b1\\fs%d\\fn%s\\alpha&H%s&}%s",
             x, dm.y, dm.color, o.font_size, o.fontname, ass_alpha, dm.text
         )
     end

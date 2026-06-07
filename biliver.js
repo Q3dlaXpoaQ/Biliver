@@ -26,7 +26,8 @@ const CONFIG = {
     preferredSubtitle: "off",
   },
   bilibiliLive: {
-    preferredQuality: "4", // 原画
+    preferredQuality: "10000", // 原画
+    preferredCodec: "12", // HEVC (0=AVC, 12=HEVC, 13=AV1)
     preferredLine: "0",
   },
 };
@@ -186,7 +187,11 @@ async function fetchJSON(url) {
 async function getVideoInfoByBvid(pageUrl) {
   const bvMatch = pageUrl.match(/BV([0-9a-zA-Z]+)/);
   const avMatch = pageUrl.match(/av(\d+)/);
-  const param = bvMatch ? `bvid=${bvMatch[1]}` : avMatch ? `aid=${avMatch[1]}` : null;
+  const param = bvMatch
+    ? `bvid=${bvMatch[1]}`
+    : avMatch
+      ? `aid=${avMatch[1]}`
+      : null;
   if (!param) throw new Error("找不到 BV/AV 号");
 
   const resp = await fetchJSON(
@@ -325,15 +330,102 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
   );
   if (!roomMatch) throw new Error("找不到直播间 ID");
   const roomid = roomMatch[1];
-  const quality = CONFIG.bilibiliLive.preferredQuality;
 
-  // 构建请求 URL，添加必要的参数
-  const url = new URL(`https://api.live.bilibili.com/room/v1/Room/playUrl`);
-  url.searchParams.set("quality", quality);
-  url.searchParams.set("cid", roomid);
-  url.searchParams.set("qn", "10000");
-  url.searchParams.set("platform", "web");
-  url.searchParams.set("t", Date.now());
+  // ---- 1. DASH API: getRoomPlayInfo ----
+  // 与 web player 使用相同接口，获取多质量/编码/协议的流信息
+  try {
+    const cookie = enhanceCookieString(document.cookie);
+    const headers = {
+      "User-Agent": getSafeUA(),
+      Origin: "https://live.bilibili.com",
+      Referer: `https://live.bilibili.com/${roomid}`,
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+      "Accept-Encoding": "gzip, deflate, br",
+      ...(cookie && { Cookie: cookie }),
+    };
+
+    const params = new URLSearchParams({
+      room_id: roomid,
+      protocol: "0,1", // 0=FLV, 1=DASH
+      format: "0,1,2", // 0=FLV, 1=TS, 2=M4S(fmp4)
+      codec: "0,1,2",  // 0=AVC, 1=HEVC, 2=AV1
+      qn: "10000",
+      platform: "web",
+    });
+
+    const resp = await fetch(
+      `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${params}`,
+      { method: "GET", headers, credentials: "include" },
+    );
+
+    if (!resp.ok) throw new Error(`API 请求失败: ${resp.status}`);
+
+    const data = await resp.json();
+    const playurl = data?.data?.playurl_info?.playurl;
+    if (!playurl?.stream?.length) throw new Error("直播流信息为空");
+
+    // 1a) 首选: http_stream → flv → AVC (最高画质 + 无HEVC解码问题)
+    for (const s of playurl.stream) {
+      if (s.protocol_name !== "http_stream") continue;
+      for (const fmt of s.format || []) {
+        if (fmt.format_name !== "flv") continue;
+        // 选 AVC (最兼容), 避免 HEVC/AV1 解码问题
+        const avcCodec = (fmt.codec || []).find(c => c.codec_name === "avc");
+        if (avcCodec?.url_info?.[0]) {
+          const host = avcCodec.url_info[0].host;
+          const base = avcCodec.base_url;
+          const extra = avcCodec.url_info[0].extra;
+          // 将 qn 提升到 10000 (原画)
+          const flvUrl = host + base + extra.replace(/qn=\d+/, "qn=10000");
+          return { video: flvUrl, roomid, headers: { Cookie: cookie } };
+        }
+      }
+    }
+
+    // 1b) 回退: http_hls → fmp4 → master_url (m3u8 多码率自适应)
+    for (const s of playurl.stream) {
+      if (s.protocol_name !== "http_hls") continue;
+      for (const fmt of s.format || []) {
+        if (fmt.format_name !== "fmp4") continue;
+        if (!fmt.master_url) continue;
+        let masterUrl = fmt.master_url;
+        masterUrl = masterUrl.replace(/qn=\d+/, "qn=10000");
+        masterUrl += (masterUrl.includes("?") ? "&" : "?") + "codec=0";
+        return { video: masterUrl, roomid, headers: { Cookie: cookie } };
+      }
+    }
+
+    // 1c) http_hls.ts 作为最后保险
+    for (const s of playurl.stream) {
+      if (s.protocol_name !== "http_hls") continue;
+      for (const fmt of s.format || []) {
+        if (fmt.format_name !== "ts") continue;
+        const avcCodec = (fmt.codec || []).find(c => c.codec_name === "avc");
+        if (avcCodec?.url_info?.[0]) {
+          const host = avcCodec.url_info[0].host;
+          const base = avcCodec.base_url;
+          const extra = avcCodec.url_info[0].extra;
+          return { video: host + base + extra.replace(/qn=\d+/, "qn=10000"), roomid, headers: { Cookie: cookie } };
+        }
+      }
+    }
+
+    throw new Error("未找到可用的直播流");
+  } catch (e) {
+    // 继续走回退流程
+    console.warn("DASH API 失败，回退到 playUrl:", e);
+  }
+
+  // ---- 2. 回退：旧版 playUrl API ----
+  const quality = CONFIG.bilibiliLive.preferredQuality;
+  const legacyUrl = new URL(
+    `https://api.live.bilibili.com/room/v1/Room/playUrl`,
+  );
+  legacyUrl.searchParams.set("quality", quality);
+  legacyUrl.searchParams.set("cid", roomid);
+  legacyUrl.searchParams.set("platform", "web");
+  legacyUrl.searchParams.set("t", Date.now());
 
   const cookie = enhanceCookieString(document.cookie);
   const headers = {
@@ -351,7 +443,7 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
   };
 
   try {
-    const resp = await fetch(url.toString(), {
+    const resp = await fetch(legacyUrl.toString(), {
       method: "GET",
       headers,
       credentials: "include",
@@ -374,7 +466,9 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
     const durls = data.data.durl;
     const line = parseInt(CONFIG.bilibiliLive.preferredLine);
     const durl =
-      line >= 0 && line < durls.length ? durls[line] : durls[durls.length - 1];
+      line >= 0 && line < durls.length
+        ? durls[line]
+        : durls[durls.length - 1];
     if (!durl) throw new Error("未找到有效的直播流线路");
 
     return { video: durl.url, roomid, headers };
@@ -424,7 +518,9 @@ function buildMpvCommand(media) {
     "--tls-verify=no",
     media.cid ? `--script-opts-append="cid=${media.cid}"` : "",
     '--script-opts-append="biliver_enabled=yes"',
-    media.roomid ? `--script-opts-append=biliver_room_id=${media.roomid} --no-ytdl --no-cache` : "",
+    media.roomid
+      ? `--script-opts-append=biliver_room_id=${media.roomid} --no-ytdl --no-cache --hls-bitrate=max`
+      : "",
     media.title ? `--force-media-title="${media.title}"` : "",
     media.time ? `--start="${media.time}"` : "",
   ];
@@ -463,6 +559,7 @@ async function handleClick() {
     if (isLive) {
       const result = await getLiveStreamUrl(pageUrl);
       media.video = result.video;
+      media.audio = result.audio;
       media.roomid = result.roomid;
       media.origin = "https://live.bilibili.com";
       media.referer = `https://live.bilibili.com/${result.roomid}`;
