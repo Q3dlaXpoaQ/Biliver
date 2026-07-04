@@ -10,6 +10,7 @@ local o = {
     area = 0.45,
     fontname = "Microsoft YaHei",
     fps_vf = "yes",
+    max_pool = 300, -- 直播弹幕池大小上限，防止长时间观看后掉帧
 }
 options.read_options(o, "biliver")
 
@@ -174,6 +175,14 @@ local function render_frame()
             alive[#alive + 1] = dm
         end
     end
+    if #alive > o.max_pool then
+        local start_idx = #alive - o.max_pool + 1
+        local trimmed = {}
+        for i = start_idx, #alive do
+            trimmed[#trimmed + 1] = alive[i]
+        end
+        alive = trimmed
+    end
     dm_pool = alive
 
     if #dm_pool == 0 then
@@ -220,6 +229,14 @@ local function add_danmaku(color, text, y_hint)
     local track, effective_start = pick_track(tw)
     local y_pos = TOP_MARGIN + (track - 1) * track_height
 
+    if #dm_pool >= o.max_pool then
+        local start_idx = #dm_pool - o.max_pool + 2
+        local trimmed = {}
+        for i = start_idx, #dm_pool do
+            trimmed[#trimmed + 1] = dm_pool[i]
+        end
+        dm_pool = trimmed
+    end
     dm_pool[#dm_pool + 1] = {
         text = text,
         color = color,
@@ -455,10 +472,18 @@ local function toggle_danmaku()
         end
         start_render()
     else
+        dm_pool = {}
+        track_until = {}
         if overlay then
             overlay.hidden = true
+            overlay.data = ""
             overlay:update()
         end
+        if render_timer then
+            render_timer:kill()
+            render_timer = nil
+        end
+        render_running = false
     end
     mp.osd_message(danmaku_visible and "弹幕: 开启" or "弹幕: 关闭", 1.5)
 end
