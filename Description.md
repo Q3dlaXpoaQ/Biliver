@@ -1,256 +1,311 @@
-# Biliver 项目实现逻辑与方法说明
+# Biliver 技术架构文档
 
-本文档详细描述了 Biliver 插件的架构和实现细节，为开发者或 AI 助手提供深度理解。
+面向开发者和 AI 助手的深度参考，描述项目架构、核心算法与数据流。
 
-## 1. 整体架构
+## 1. 架构总览
 
-Biliver 采用 **前端解析 → 指令传递 → Lua 播放器逻辑 → Python 后端 → OSD 渲染** 的闭环架构。
+三组件协作：**油猴脚本(浏览器) → Lua 脚本(MPV内) → Python 后端(子进程)**
 
 ```
-┌──────────────┐    指令     ┌────────────┐    IPC     ┌──────────────┐
-│  油猴脚本     │ ────────►  │  main.lua   │ ────────► │  biliver.py   │
-│ biliver.js   │            │  (Lua/MPV)  │           │  (Python)     │
-└──────────────┘            └──────┬─────┘           └──────┬───────┘
-                                   │                        │
-                                   │  OSD overlay           │  WebSocket / HTTP
-                                   │  (零闪烁 60fps)         │  (弹幕数据)
-                                   ▼                        ▼
-                              ┌────────────┐           ┌──────────────┐
-                              │   MPV      │           │ Bilibili API │
-                              │  播放器     │           │  WebSocket   │
-                              └────────────┘           └──────────────┘
+┌──────────────┐   MPV指令    ┌────────────┐   IPC管道    ┌──────────────┐
+│ biliver.js   │ ──────────► │ main.lua   │ ──────────► │ biliver.py   │
+│ (油猴脚本)    │  (剪贴板)    │ (MPV Lua)  │  (JSON+LF)  │ (Python)     │
+└──────────────┘             └─────┬──────┘             └──────┬───────┘
+                                   │                           │
+                            OSD overlay                   WebSocket/HTTP
+                            (60fps渲染)                   (弹幕数据源)
+                                   │                           │
+                                   ▼                           ▼
+                             ┌──────────┐              ┌──────────────┐
+                             │ MPV 播放器 │              │ Bilibili API │
+                             └──────────┘              └──────────────┘
 ```
 
-### 组件职责
+**两种弹幕模式：**
 
-| 组件 | 文件 | 职责 |
-| :--- | :--- | :--- |
-| **前端** | `biliver.js` (油猴脚本) | 从 B 站页面提取播放 URL、CID/房间号、Cookie，生成 MPV 启动指令 |
-| **Lua 逻辑** | `main.lua` | 弹幕 OSD 渲染、60fps 补帧、Python 后端进程管理、IPC 通信 |
-| **Python 后端** | `biliver.py` | 弹幕协议解析 (WebSocket)、VOD 弹幕下载、轨道碰撞计算、IPC 消息发送 |
-| **用户配置** | `biliver.conf` | 字体、大小、透明度、速度、显示区域等参数 |
+| 模式 | 触发条件 | 弹幕获取 | 渲染方式 | 弹幕来源 |
+| :--- | :--- | :--- | :--- | :--- |
+| **VOD 点播** | URL 含 BV/AV/CID | HTTP → XML → ASS 文件 | MPV 原生字幕 | 历史弹幕 |
+| **Live 直播** | URL 含直播间号 | WebSocket 实时接收 | OSD overlay 60fps | 实时弹幕 |
 
 ---
 
-## 2. 前端解析层 (`biliver.js`)
+## 2. 油猴脚本 (`biliver.js`)
 
-### 核心逻辑
-- **SPA 适配**: 通过 `History API` 钩子 + `setInterval` 轮询检测 B 站 URL 变化
-- **按需显示**: 仅在有效视频/直播页面且 API 返回 `aid/cid` 后显示启动按钮
-- **CDN 提取**: 
-  - 点播: 获取 DASH 流（音画分离，支持高码率/4K/HDR）
-  - 直播: 解析 `playUrl` 接口，提取原画直播流
-- **防 403**: 指令包含 `Origin` 和 `Referer` 头，B 站 CDN 强制校验
-- **状态注入**: `biliver_enabled=yes`、`cid`/`biliver_room_id`、`--start` (同步进度)
+### 职责
+在 B 站页面提取视频/直播流 URL 和认证信息，生成 MPV 启动命令复制到剪贴板。
+
+### 核心流程
+
+```
+页面加载 → URL检测 → API获取 aid/cid → 提取CDN流 → 构建MPV指令 → 复制剪贴板
+```
+
+### 关键实现
+
+- **SPA 路由适配**: 钩住 `history.pushState/replaceState` + `popstate` + 1.5s 轮询兜底，检测 B 站 SPA 页面切换
+- **智能按钮显示**: 直播页直接显示；点播页需先通过 API 拿到 `aid/cid` 后才显示（重试5次，间隔600ms）
+- **CDN 提取策略**:
+  - 点播: 优先 DASH 流（音画分离，支持4K/HDR/FLAC），fallback 到 FLV/MP4
+  - 直播: `playUrl` 接口获取原画流
+- **认证处理**: 精简 Cookie（仅保留关键认证字段），Android UA 替换为桌面 UA 避免 B 站拦截
+- **防 403**: 指令中携带 `Origin` + `Referer` 头（B 站 CDN 强制校验）
+- **状态注入**: 通过 `--script-opts-append` 传递 `biliver_enabled=yes`、`cid`、`biliver_room_id`，Lua 端据此判断是否启用
+- **进度同步**: 读取 `<video>.currentTime`，通过 `--start` 参数传递给 MPV
+
+### 支持的 URL 模式
+
+| 页面 | 提取方式 |
+| :--- | :--- |
+| `/video/BVxxx` | BVID → API 获取 aid/cid |
+| `/video/avxxx` | AID → API 获取 cid |
+| `/bangumi/play/epxxx` | EPID → 番剧 API → aid/cid |
+| `live.bilibili.com/xxx` | 房间号直接提取 |
 
 ---
 
-## 3. 弹幕渲染层 (`main.lua`)
+## 3. Lua 渲染层 (`main.lua`)
 
-### 3.1 直播弹幕渲染（核心）
+### 职责
+弹幕渲染、60fps 补帧滤镜管理、Python 后端进程生命周期、弹幕开关。
 
-使用 **`mp.create_osd_overlay("ass-events")`** 实现零闪烁渲染：
-
-```
-┌─────────────────────────────────────────────────────┐
-│  overlay (OSD 覆盖层)                                │
-│  ┌───────────────────────────────────────────────┐  │
-│  │ {\an7\pos(1764,10)\c&HFFFFFF&\bord0\shad0...} │  ← 弹幕1
-│  │ {\an7\pos(1452,54)\c&HFF0000&\bord0\shad0...} │  ← 弹幕2
-│  │ {\an7\pos(1140,98)\c&H00FF00&\bord0\shad0...} │  ← 弹幕3
-│  └───────────────────────────────────────────────┘  │
-│  每行 = 一个独立 ASS 事件，\pos 各自独立              │
-└─────────────────────────────────────────────────────┘
-```
-
-**关键特性：**
-- **零闪烁**: `overlay:update()` 原子替换整个覆盖层内容，无字幕轨道切换
-- **60fps 平滑**: `mp.add_timeout(0, render_frame)` 链式调用，每帧计算所有弹幕位置
-- **单调时钟**: `mp.get_time()` 驱动动画，消除 `time-pos` 在直播中的不稳定性
-- **无边框/阴影**: `\bord0\shad0` 实现极简视觉
-- **独立定位**: `\n` 分隔每行，每行是独立 ASS 事件，`\pos` 互不干扰
-
-### 3.2 渲染流程
+### 3.1 启动检测 (`on_start_file`)
 
 ```
-add_danmaku(color, text, y_hint)
-    │
-    ├─► pick_track(text_width)       ← 轨道分配（碰撞检测）
-    │       │
-    │       ├─ 空闲车道 → 立即使用
-    │       └─ 全部忙碌 → 排队等待（effective_start 延迟入画）
-    │
-    ├─► 创建弹幕对象存入 dm_pool
-    │       born = effective_start    ← 实际开始时间（可能延迟）
-    │       lifespan = o.duration     ← 生命周期
-    │       start_x = live_w          ← 起始位置（右边缘）
-    │       end_x = -1200             ← 结束位置（左边缘外）
-    │
-    └─► start_render()
-            │
-            └─► mp.add_timeout(0, render_frame)  ← 60fps 渲染循环
-                    │
-                    ├─► now = mp.get_time()
-                    ├─► 清理过期弹幕 (now - born > lifespan)
-                    ├─► 计算每条弹幕 x = start_x - speed * elapsed
-                    ├─► 构建 ASS 字符串（\n 分隔）
-                    └─► overlay:update()           ← 原子替换
+start-file 事件
+  ├─ script-opts 中无 biliver 标记 → 忽略（普通视频）
+  ├─ 含 biliver_room_id → 直播模式
+  │     ├─ init_live_osd()     创建 OSD overlay
+  │     ├─ update_fps_vf(true) 强制补帧
+  │     └─ 启动 biliver.py live 子进程
+  └─ 含 cid / BV / AV → 点播模式
+        └─ 启动 biliver.py vod 子进程 → 生成 ASS → sub-add 加载
 ```
+
+### 3.2 直播弹幕渲染（核心）
+
+使用 `mp.create_osd_overlay("ass-events")` 实现 **零闪烁** 渲染：
+
+```
+overlay.data = 每行一个ASS事件, \n 分隔
+overlay:update()  →  原子替换整个覆盖层, 无闪烁
+
+每条弹幕 = {\an7\pos(x,y)\c&HBBGGRR&\bord0\shad0\fs36\fn字体\alpha&HAA&}文字
+```
+
+**渲染循环:**
+
+```
+add_danmaku(color, text)
+  ├─ pick_track(text_width) → 分配轨道 + 计算出生时间
+  ├─ 存入 dm_pool (弹幕对象: text, color, y, born, lifespan, start_x, end_x)
+  └─ start_render()
+       └─ mp.add_timeout(0, render_frame)  ← 60fps 链式调度
+            ├─ now = mp.get_time()
+            ├─ 清理过期弹幕 (now - born > lifespan)
+            ├─ 逐条计算 x = start_x - speed * elapsed
+            ├─ 拼接 ASS 字符串
+            └─ overlay:update()
+```
+
+**关键设计:**
+- `mp.add_timeout(0, ...)` 递归调用 → 每 MPV 帧回调一次 → 60fps
+- `mp.get_time()` 单调时钟 → 直播无 `time-pos`，需独立时间驱动
+- 弹幕池 (`dm_pool`) 自动 GC：每帧清除过期弹幕，空池时停止渲染循环
 
 ### 3.3 轨道分配算法 (`pick_track`)
 
-```lua
-local function pick_track(text_width)
-    local now = mp.get_time()
-    local travel_time = text_width / danmaku_speed + 0.2  -- 通过时间 + 安全余量
-    
-    -- 1. 优先使用空闲车道
-    for i = 1, max_tracks do
-        if now >= (track_until[i] or 0) then
-            track_until[i] = now + travel_time
-            return i, now  -- 立即开始
-        end
-    end
-    
-    -- 2. 全部忙碌时，选最早空闲的车道并排队
-    local best = 1
-    for i = 2, max_tracks do
-        if (track_until[i] or 0) < (track_until[best] or 0) then
-            best = i
-        end
-    end
-    local effective_start = (track_until[best] or now)  -- 排队等待
-    track_until[best] = effective_start + travel_time
-    return best, effective_start  -- 延迟开始
-end
 ```
+pick_track(text_width):
+  travel_time = text_width / speed + 0.2   // 文字通过时间 + 安全余量
 
-**排队机制**: 当所有车道忙碌时，新弹幕的 `born` 时间被设为 `effective_start`（前车移走的时间）。在等待期间 `elapsed = now - born < 0`，弹幕停在右边缘外（不可见），直到车道空闲才开始移动。这**彻底消除了重叠**。
+  1. 遍历所有轨道, 找首个空闲轨道 (now >= track_until[i])
+     → 立即使用, 返回 (track, now)
+
+  2. 全部忙碌 → 找最早空闲的轨道 (min track_until)
+     → effective_start = track_until[best]  // 排队等待前车离开
+     → born = effective_start               // 延迟"出生"
+     → 弹幕在等待期间 elapsed < 0, x 在右边缘外(不可见)
+     → 彻底消除重叠
+```
 
 ### 3.4 60fps 补帧滤镜
 
 ```lua
--- 低于 59fps 的视频自动挂载 fps=60 补帧滤镜
+-- 视频 < 59fps 且倍速 < 2x 时挂载
 mp.commandv('vf', 'append', '@Biliver-FPS:fps=fps=60:round=near')
+-- 直播模式: 强制挂载 (container-fps 可能不可用)
+-- 倍速 ≥ 2x: 自动移除 (避免性能问题)
+-- 监听 container-fps 和 speed 属性动态调整
 ```
 
-确保即使 24fps 视频，弹幕也能以 60fps 物理刷新率平滑移动。
+### 3.5 弹幕开关
 
-### 3.5 弹幕样式
-
-每条弹幕的 ASS 标签格式：
-```
-{\an7\pos(x,y)\c&HBBGGRR&\bord0\shad0\fs<size>\fn<font>\alpha&H<alpha>&}text
-```
-
-| 标签 | 作用 |
-| :--- | :--- |
-| `\an7` | 对齐方式：左上角 |
-| `\pos(x,y)` | 位置（每帧动态计算） |
-| `\c&HBBGGRR&` | 文字颜色（来自 B 站用户等级） |
-| `\bord0` | 无边框 |
-| `\shad0` | 无阴影 |
-| `\fs<size>` | 字体大小（用户配置） |
-| `\fn<font>` | 字体名称（用户配置） |
-| `\alpha&H<alpha>&` | 透明度（用户配置） |
-
-### 3.6 快捷键
-
-| 快捷键 | 功能 |
-| :--- | :--- |
-| `Ctrl+D` | 切换弹幕显示/隐藏（通过 `overlay.hidden` 属性） |
+- VOD: 切换 `sub-visibility` (MPV 原生字幕)
+- Live: 切换 `overlay.hidden` + 暂停/恢复渲染循环
 
 ---
 
 ## 4. Python 后端 (`biliver.py`)
 
-### 4.1 直播模式 (`run_live`)
+### 职责
+弹幕协议解析、轨道计算、IPC 通信、ASS 文件生成。
 
-- **WebSocket 连接**: 连接 Bilibili 直播弹幕服务器
-- **Protobuf 解析**: 处理 Brotli 压缩的弹幕包
-- **颜色转换**: `&H{B}{G}{R}&` 格式（ASS 兼容）
-- **IPC 通信**: 通过命名管道 (Windows) / Unix Socket 发送 `script-message biliver-danmaku`
-- **自动重连**: 连接断开后 5 秒自动重连
-- **队列管理**: 异步队列 + 定期清理，防止内存泄漏
-
-### 4.2 点播模式 (`run_vod`)
-
-- **弹幕下载**: 通过 Bilibili API 获取 XML 格式历史弹幕
-- **DanmakuManager**: 预计算所有弹幕的轨道和位置
-- **ASS 文件生成**: 输出完整 ASS 字幕文件供 MPV 加载
-- **碰撞检测**: 基于弹幕长度和速度的轨道分配算法
-
-### 4.3 IPC 通信协议
-
-Lua ↔ Python 通过命名管道（Windows）或 Unix Socket 通信：
+### 4.1 直播模式
 
 ```
-Python 发送:
-["script-message", "biliver-danmaku", color, text, y_hint]
+BLiveClient
+  ├─ init_room()     → API 获取真实房间号 + 弹幕服务器配置
+  ├─ ws_connect()    → 连接 wss:// 弹幕服务器
+  ├─ AUTH 认证       → 发送 {uid, roomid, protover:3, key}
+  ├─ 心跳包          → 每 25s 发送空心跳 (ver=1, op=2)
+  ├─ 数据包解析      → 处理 Brotli/Zlib 压缩 → JSON 解析
+  └─ handler 回调    → 提取 DANMU_MSG → 颜色转换 → IPC 发送
 
-Lua 接收:
-mp.register_script_message("biliver-danmaku", add_danmaku)
+DanmakuManager
+  ├─ find_track()    → 轨道碰撞检测 (与 Lua 端算法一致)
+  ├─ cleanup_tracks() → 定期清理过期轨道时间戳
+
+IPC 通信
+  ├─ 异步队列 (asyncio.Queue) + 独立写入线程
+  ├─ 队列满载 (>180) → 丢弃最旧 30% 消息
+  ├─ IPC 断线监控 → 7s 无响应自动退出
+  └─ 协议: JSON {"command": ["script-message", "biliver-danmaku", color, text, y_hint]}
+```
+
+### 4.2 点播模式
+
+```
+run_vod(target_id):
+  ├─ BV/AV → API 获取 CID
+  ├─ HTTP 下载 XML 弹幕 (自动处理 gzip/zlib/raw deflate)
+  ├─ DanmakuManager 预计算所有弹幕轨道
+  └─ 生成 ASS 字幕文件
+       ├─ 滚动弹幕 (mode 1,6): \move(start_x, y, end_x, y)
+       ├─ 顶部弹幕 (mode 5):   \an8\pos(center, y)
+       └─ 底部弹幕 (mode 4):   \an2\pos(center, y)
+```
+
+### 4.3 Bilibili 弹幕协议
+
+```
+包头: 16字节 (big-endian)
+  [pack_len:4][raw_header_size:2][ver:2][operation:4][seq:4]
+
+operation:
+  7 = AUTH (认证)
+  2 = HEARTBEAT (心跳)
+  3 = HEARTBEAT_REPLY
+  5 = SEND_MSG_REPLY (弹幕消息)
+
+ver:
+  0 = NORMAL (明文JSON)
+  2 = ZLIB 压缩
+  3 = BROTLI 压缩
+
+弹幕消息: cmd="DANMU_MSG", info[0][3]=颜色, info[1]=文字
+```
+
+### 4.4 IPC 通信协议
+
+```
+传输层: 命名管道 (Windows: \\.\pipe\mpv-biliver-XXXXX)
+        Unix Socket (Linux/macOS: /tmp/mpv-biliver-XXXXX.sock)
+
+格式: 每行一个 JSON 命令 + \n
+
+Python → MPV:
+  {"command": ["script-message", "biliver-danmaku", "&HBBGGRR&", "弹幕文字", "y坐标"]}
+
+Lua 端接收:
+  mp.register_script_message("biliver-danmaku", add_danmaku)
 ```
 
 ---
 
-## 5. 数据流向
+## 5. 数据流总览
 
-```mermaid
-flowchart LR
-    A[浏览器] -->|生成指令| B(剪贴板)
-    B -->|手动运行| C[MPV 播放器]
-    C -->|加载脚本| D[main.lua]
-    D -->|挂载 60fps 滤镜| C
-    D -->|启动后端| E[biliver.py]
-    E -->|WebSocket/HTTP| F[B站服务器]
-    F -->|弹幕数据| E
-    E -->|IPC 管道| D
-    D -->|OSD overlay 渲染| C
+```
+用户点击播放图标
+    │
+    ▼
+biliver.js 提取 CDN URL + 认证信息 + CID/房间号
+    │
+    ▼
+生成 MPV 指令 → 复制到剪贴板
+    │
+    ▼ (用户粘贴执行)
+MPV 启动，加载 main.lua
+    │
+    ├─ VOD: main.lua 启动 biliver.py vod
+    │         biliver.py 下载弹幕 → 生成 ASS → 退出
+    │         main.lua 加载 ASS 字幕 → MPV 原生渲染
+    │
+    └─ Live: main.lua 创建 OSD overlay + 强制补帧
+              main.lua 启动 biliver.py live
+              biliver.py WebSocket 接收弹幕 → IPC 管道发送
+              main.lua 接收 → 轨道分配 → 60fps OSD 渲染
 ```
 
 ---
 
-## 6. 关键方法索引
+## 6. 清理与退出
+
+`end-file` 事件触发时：
+1. 终止 Python 子进程 (`mp.abort_async_command`)
+2. 移除补帧滤镜 (`vf remove @Biliver-FPS`)
+3. 删除临时 ASS 文件 (VOD)
+4. 销毁 OSD overlay (Live)
+5. 停止渲染循环，清空弹幕池
+6. 恢复 MPV `msg-level` 设置
+
+---
+
+## 7. 方法索引
 
 ### `main.lua`
+
 | 方法 | 作用 |
 | :--- | :--- |
-| `init_live_osd()` | 初始化 OSD overlay 覆盖层，创建渲染环境 |
-| `add_danmaku(color, text, y_hint)` | 接收弹幕，分配轨道，加入渲染池 |
-| `pick_track(text_width)` | 轨道分配 + 碰撞检测 + 排队机制 |
-| `render_frame()` | 60fps 渲染循环：计算位置 → 构建 ASS → overlay:update() |
-| `start_render()` | 启动渲染循环（`mp.add_timeout(0, ...)` 链式调用） |
-| `update_fps_vf(force)` | 动态 FPS 监测 + 60fps 补帧滤镜挂载/移除 |
+| `on_start_file()` | 入口: 检测直播/点播，启动后端 |
+| `init_live_osd()` | 创建 OSD overlay，初始化渲染环境 |
+| `add_danmaku(color, text)` | 接收弹幕 → 分配轨道 → 加入渲染池 |
+| `pick_track(text_width)` | 轨道碰撞检测 + 排队机制 |
+| `render_frame()` | 60fps 渲染: 计算位置 → ASS → overlay:update() |
+| `start_render()` | 启动渲染循环 |
+| `update_fps_vf(force)` | 动态 60fps 补帧滤镜管理 |
+| `safe_remove_fps_vf()` | 安全移除补帧滤镜 |
 | `toggle_danmaku()` | 弹幕显示/隐藏切换 |
-| `on_start_file()` | 文件加载事件：检测直播/点播，启动后端 |
+| `process_vod(target_id)` | 点播: 启动 Python 转换 + 加载 ASS |
+| `sanitize_text(text)` | 清理弹幕文本 (移除 `{}` `\n`) |
+| `estimate_text_width(text)` | 估算文字像素宽度 (ASCII=0.6x, CJK=1.05x) |
 
 ### `biliver.py`
-| 方法 | 作用 |
+
+| 类/方法 | 作用 |
 | :--- | :--- |
-| `run_live(room_id, ipc_path, ...)` | 直播模式入口：WebSocket 连接 + 弹幕解析 |
-| `run_vod(video_id, ...)` | 点播模式入口：弹幕下载 + ASS 文件生成 |
-| `DanmakuManager.get_track(msg_len)` | 轨道分配与碰撞规避算法 |
-| `BLiveClient._on_danmaku()` | 直播弹幕实时解析回调 |
-| `send_mpv_async(queue, args)` | 异步 IPC 消息发送 |
+| `BLiveClient` | WebSocket 直播弹幕客户端 |
+| `BLiveClient.init_room()` | API 获取真实房间号 + 弹幕服务器配置 |
+| `BLiveClient.run()` | 连接 + 认证 + 心跳 + 接收消息循环 |
+| `BLiveClient._p_ws(data)` | 数据包解压 (Brotli/Zlib) + JSON 解析 |
+| `DanmakuManager` | 弹幕轨道管理器 |
+| `DanmakuManager.find_track(text)` | 轨道分配与碰撞规避 |
+| `DanmakuManager.cleanup_tracks()` | 清理过期轨道时间戳 |
+| `run_live(room_id, ipc_path, ...)` | 直播模式入口 |
+| `run_vod(target_id, ...)` | 点播模式入口: XML → ASS |
+| `ipc_worker(queue, path)` | 异步 IPC 写入协程 |
+| `send_mpv_async(queue, cmd)` | 非阻塞 IPC 发送 (队列满时丢弃旧消息) |
+| `connection_monitor(ipc_path)` | IPC 断线监控 (7s 超时自动退出) |
 
 ---
 
-## 7. 渲染方案演进历史
+## 8. 渲染方案演进
 
 | 方案 | 问题 | 状态 |
 | :--- | :--- | :--- |
-| ASS 文件 + `sub-reload` (0.1s) | 严重闪烁（每秒 10 次字幕重载） | ❌ 废弃 |
-| ASS 文件 + `sub-reload` (0.5s/1.5s) | 闪烁减轻但仍明显，弹幕从屏幕中间出现 | ❌ 废弃 |
-| `osd-ass-1` ~ `osd-ass-9` 属性 | 在当前 MPV 版本中不显示 | ❌ 废弃 |
-| `mp.set_osd_ass` 多 `\pos` 拼接 | 所有文字渲染在同一位置（`\pos` 不分行独立） | ❌ 废弃 |
-| `mp.set_osd_ass` + `\N` 分隔 | 仍无法实现多位置独立渲染 | ❌ 废弃 |
-| **`mp.create_osd_overlay("ass-events")`** | **✅ 当前方案：零闪烁，每行独立 ASS 事件** | ✅ 使用中 |
-
-### 当前方案核心原理
-- `mp.create_osd_overlay("ass-events")` 创建独立 OSD 覆盖层
-- `data` 字符串按 `\n` 分割，**每行是一个独立的 ASS Dialogue 事件**
-- 每个事件有自己的 `\pos`，互不干扰
-- `overlay:update()` 原子替换整个覆盖层，无闪烁
-- `mp.get_time()` 单调时钟驱动动画，无抖动
-- 轨道排队机制 (`effective_start`) 彻底消除重叠
+| ASS 文件 + `sub-reload` (0.1s) | 严重闪烁 | ❌ 废弃 |
+| ASS 文件 + `sub-reload` (0.5s/1.5s) | 闪烁减轻，弹幕从中间出现 | ❌ 废弃 |
+| `osd-ass-1` ~ `osd-ass-9` 属性 | 当前 MPV 版本不显示 | ❌ 废弃 |
+| `mp.set_osd_ass` 多 `\pos` | 所有文字渲染在同一位置 | ❌ 废弃 |
+| `mp.set_osd_ass` + `\N` 分隔 | 无法多位置独立渲染 | ❌ 废弃 |
+| **`mp.create_osd_overlay("ass-events")`** | **零闪烁，每行独立 ASS 事件** | ✅ 当前 |

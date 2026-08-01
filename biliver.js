@@ -1,11 +1,11 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name                    Biliver Helper
 // @name:zh-CN              Biliver 助手
 // @namespace               https://github.com/biliver
 // @version                 1.0.0
 // @license                 MIT
 // @description             Extract Bilibili video/live CDN links and copy MPV command to clipboard
-// @description:zh-CN       提取B站视频/直播 CDN 链接并一键复制 MPV 指令到剪贴板
+// @description:zh-CN       提取B站视频/直播 CDN 链接并一键复制MPV 指令到剪贴板
 // @author                  Biliver
 // @match                   https://www.bilibili.com/video/*
 // @match                   https://www.bilibili.com/bangumi/play/*
@@ -91,7 +91,7 @@ function getSafeUA() {
 function extractKeyCookies(cookieString) {
   if (!cookieString) return "";
 
-  // 关键的 B 站认证 cookie
+  // 关键且 B 站认为必要的 cookie
   const keyCookies = [
     "bili_jct", // CSRF token
     "DedeUserID", // 用户ID
@@ -104,7 +104,7 @@ function extractKeyCookies(cookieString) {
     "sid", // 会话ID
     "bili_ticket", // 登录票据
     "bili_ticket_expires", // 票据过期时间
-    "CURRENT_FNVAL", // 当前功能值
+    "CURRENT_FNVAL", // 当前功能版本
   ];
 
   const cookies = [];
@@ -332,7 +332,7 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
   const roomid = roomMatch[1];
 
   // ---- 1. DASH API: getRoomPlayInfo ----
-  // 与 web player 使用相同接口，获取多质量/编码/协议的流信息
+  // 获取 web player 使用相同接口，获取多质量/编码/协议的流信息
   try {
     const cookie = enhanceCookieString(document.cookie);
     const headers = {
@@ -365,25 +365,25 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
     const playurl = data?.data?.playurl_info?.playurl;
     if (!playurl?.stream?.length) throw new Error("直播流信息为空");
 
-    // 1a) 首选: http_stream → flv → AVC (最高画质 + 无HEVC解码问题)
+    // 1a) 首选 http_stream 格式 flv 格式 AVC (最高画质 + 无HEVC解码问题)
     for (const s of playurl.stream) {
       if (s.protocol_name !== "http_stream") continue;
       for (const fmt of s.format || []) {
         if (fmt.format_name !== "flv") continue;
-        // 选 AVC (最兼容), 避免 HEVC/AV1 解码问题
+        // 优先 AVC (最兼容), 避免 HEVC/AV1 解码问题
         const avcCodec = (fmt.codec || []).find(c => c.codec_name === "avc");
         if (avcCodec?.url_info?.[0]) {
           const host = avcCodec.url_info[0].host;
           const base = avcCodec.base_url;
           const extra = avcCodec.url_info[0].extra;
-          // 将 qn 提升到 10000 (原画)
+          // 将 qn 提升至 10000 (原画)
           const flvUrl = host + base + extra.replace(/qn=\d+/, "qn=10000");
           return { video: flvUrl, roomid, headers: { Cookie: cookie } };
         }
       }
     }
 
-    // 1b) 回退: http_hls → fmp4 → master_url (m3u8 多码率自适应)
+    // 1b) 回退: http_hls 格式 fmp4 的 master_url (m3u8 多码率自适应)
     for (const s of playurl.stream) {
       if (s.protocol_name !== "http_hls") continue;
       for (const fmt of s.format || []) {
@@ -396,7 +396,7 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
       }
     }
 
-    // 1c) http_hls.ts 作为最后保险
+    // 1c) http_hls.ts 作为最后保底方案
     for (const s of playurl.stream) {
       if (s.protocol_name !== "http_hls") continue;
       for (const fmt of s.format || []) {
@@ -411,7 +411,7 @@ async function getLiveStreamUrl(pageUrl, retryCount = 0) {
       }
     }
 
-    throw new Error("未找到可用的直播流");
+    throw new Error("未找到可用的直播间");
   } catch (e) {
     // 继续走回退流程
     console.warn("DASH API 失败，回退到 playUrl:", e);
@@ -540,7 +540,7 @@ async function handleClick() {
   const pageUrl = location.href;
   const isLive = pageUrl.includes("live.bilibili.com");
 
-  showToast(isLive ? "正在解析直播流..." : "正在解析视频...", 6000);
+  showToast(isLive ? "正在解析直播间..." : "正在解析视频...", 6000);
 
   try {
     const media = {
@@ -580,13 +580,13 @@ async function handleClick() {
           }
           if (info?.aid && info?.cid) break;
         } catch (e) {
-          console.warn(`第 ${attempt + 1} 次尝试失败:`, e);
+          console.warn(`第${attempt + 1} 次尝试失败`, e);
           if (attempt < MAX_TRY_COUNT - 1) await sleep(RETRY_INTERVAL);
         }
       }
       if (!info?.aid || !info?.cid) throw new Error("无法获取视频信息");
 
-      // 优先 dash（支持高分辨率 + 分离音频）
+      // 优先 dash（支持高分辨率 + 分离音频流）
       const dash = await getDash(info.aid, info.cid);
       if (dash) {
         media.video = dash.video;
@@ -612,7 +612,7 @@ async function handleClick() {
 
     const cmd = buildMpvCommand(media);
     copyToClipboard(cmd);
-    showToast("✅ MPV 指令已复制到剪贴板");
+    showToast("MPV 指令已复制到剪贴板");
 
     // 暂停网页播放器
     try {
@@ -620,18 +620,135 @@ async function handleClick() {
     } catch (_) {}
   } catch (err) {
     console.error("Biliver Helper Error:", err);
-    showToast("❌ " + err.message, 5000);
+    showToast("错误: " + err.message, 5000);
   }
 }
 
+async function handlePlayClick() {
+  const pageUrl = location.href;
+  const isLive = pageUrl.includes("live.bilibili.com");
+
+  showToast(isLive ? "正在解析直播间..." : "正在解析视频...", 6000);
+
+  try {
+    const media = {
+      video: undefined,
+      audio: undefined,
+      title: undefined,
+      origin: undefined,
+      referer: undefined,
+      cookie: undefined,
+      userAgent: undefined,
+      cid: undefined,
+      roomid: undefined,
+      time: undefined,
+    };
+
+    if (isLive) {
+      const result = await getLiveStreamUrl(pageUrl);
+      media.video = result.video;
+      media.audio = result.audio;
+      media.roomid = result.roomid;
+      media.origin = "https://live.bilibili.com";
+      media.referer = `https://live.bilibili.com/${result.roomid}`;
+      media.cookie = result.headers?.Cookie || document.cookie;
+      media.userAgent = getSafeUA();
+    } else {
+      let info;
+      for (let attempt = 0; attempt < MAX_TRY_COUNT; attempt++) {
+        try {
+          if (pageUrl.includes("/bangumi/play/")) {
+            info = await getVideoInfoByEpid(pageUrl);
+          } else if (pageUrl.includes("/video/")) {
+            info = await getVideoInfoByBvid(pageUrl);
+          } else {
+            info = await getVideoInfoAuto(pageUrl);
+            if (!info) info = await getVideoInfoByBvid(pageUrl);
+          }
+          if (info?.aid && info?.cid) break;
+        } catch (e) {
+          console.warn(`第${attempt + 1} 次尝试失败`, e);
+          if (attempt < MAX_TRY_COUNT - 1) await sleep(RETRY_INTERVAL);
+        }
+      }
+      if (!info?.aid || !info?.cid) throw new Error("无法获取视频信息");
+
+      const dash = await getDash(info.aid, info.cid);
+      if (dash) {
+        media.video = dash.video;
+        media.audio = dash.audio;
+      } else {
+        media.video = await getFlvOrMP4(info.aid, info.cid);
+      }
+      media.cid = info.cid;
+      media.title = info.title || document.title;
+      media.origin = "https://www.bilibili.com";
+      media.referer = "https://www.bilibili.com/";
+      media.cookie = document.cookie;
+      media.userAgent = navigator.userAgent;
+
+      try {
+        const v = document.querySelector("video");
+        if (v && v.currentTime > 5) media.time = Math.floor(v.currentTime);
+      } catch (_) {}
+    }
+
+    if (!media.video) throw new Error("解析失败：未获取到视频地址");
+
+    const params = new URLSearchParams();
+    params.set("url", media.video);
+    params.set("headers", buildHeaderString(media));
+    if (media.cid) params.set("cid", media.cid);
+    if (media.roomid) params.set("roomid", media.roomid);
+    if (media.title) params.set("title", media.title);
+    if (media.time) params.set("start", media.time);
+
+    window.location.href = "biliver://mpv?" + params.toString();
+    showToast("正在启动 MPV...");
+
+    try {
+      document.querySelectorAll("video").forEach((v) => v.pause());
+    } catch (_) {}
+  } catch (err) {
+    console.error("Biliver Play Error:", err);
+    showToast("错误: " + err.message, 5000);
+  }
+}
+
+function buildHeaderString(media) {
+  const headers = [];
+  if (media.roomid) {
+    headers.push(...buildEnhancedHeaders(media));
+    if (!headers.some((h) => h.startsWith("Origin:"))) headers.push("Origin: https://live.bilibili.com");
+    if (!headers.some((h) => h.startsWith("Referer:"))) headers.push("Referer: https://live.bilibili.com/");
+    if (!headers.some((h) => h.startsWith("User-Agent:"))) headers.push(`User-Agent: ${getSafeUA()}`);
+    headers.push("Accept: */*");
+    headers.push("Accept-Language: zh-CN,zh;q=0.9,en;q=0.8");
+    headers.push("Connection: keep-alive");
+    headers.push("Accept-Encoding: gzip, deflate, br");
+    headers.push("Cache-Control: no-cache");
+  } else {
+    headers.push(media.origin ? `Origin: ${media.origin}` : "");
+    headers.push(media.referer ? `Referer: ${media.referer}` : "");
+    headers.push(media.cookie ? `Cookie: ${media.cookie}` : "");
+    headers.push(media.userAgent ? `User-Agent: ${media.userAgent}` : "");
+    headers.push("Accept: */*");
+    headers.push("Accept-Language: zh-CN");
+    headers.push("Connection: keep-alive");
+  }
+  return headers.filter(Boolean).join(",");
+}
+
 // ===================== 按钮 UI =====================
-function showButton() {
-  if (document.getElementById("biliver-btn")) return; // 防止重复
-  const btn = document.createElement("div");
-  btn.id = "biliver-btn";
-  Object.assign(btn.style, {
+function showButtons() {
+  if (document.getElementById("biliver-play-btn")) return;
+  
+  // Play button - opens video in MPV via biliver:// protocol
+  const playBtn = document.createElement("div");
+  playBtn.id = "biliver-play-btn";
+  Object.assign(playBtn.style, {
     position: "fixed",
-    bottom: "80px",
+    bottom: "136px",
     left: "16px",
     zIndex: "999999",
     width: "44px",
@@ -647,27 +764,65 @@ function showButton() {
     userSelect: "none",
     opacity: "0",
   });
-  btn.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
-  btn.title = "在 MPV 中播放";
-  btn.addEventListener("mouseenter", () => {
-    btn.style.transform = "scale(1.15)";
-    btn.style.boxShadow = "0 4px 20px rgba(0,161,214,0.6)";
+  playBtn.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
+  playBtn.title = "在 MPV 中播放";
+  playBtn.addEventListener("mouseenter", () => {
+    playBtn.style.transform = "scale(1.15)";
+    playBtn.style.boxShadow = "0 4px 20px rgba(0,161,214,0.6)";
   });
-  btn.addEventListener("mouseleave", () => {
-    btn.style.transform = "scale(1)";
-    btn.style.boxShadow = "0 2px 12px rgba(0,161,214,0.4)";
+  playBtn.addEventListener("mouseleave", () => {
+    playBtn.style.transform = "scale(1)";
+    playBtn.style.boxShadow = "0 2px 12px rgba(0,161,214,0.4)";
   });
-  btn.addEventListener("click", handleClick);
-  document.body.appendChild(btn);
-  // 淡入动画
+  playBtn.addEventListener("click", handlePlayClick);
+  document.body.appendChild(playBtn);
+
+  // Copy button - copies MPV command to clipboard
+  const copyBtn = document.createElement("div");
+  copyBtn.id = "biliver-copy-btn";
+  Object.assign(copyBtn.style, {
+    position: "fixed",
+    bottom: "80px",
+    left: "16px",
+    zIndex: "999999",
+    width: "44px",
+    height: "44px",
+    borderRadius: "50%",
+    background: "linear-gradient(135deg, #6c5ce7, #a29bfe)",
+    boxShadow: "0 2px 12px rgba(108,92,231,0.4)",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    transition: "transform 0.2s, box-shadow 0.2s, opacity 0.3s",
+    userSelect: "none",
+    opacity: "0",
+  });
+  copyBtn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+  copyBtn.title = "复制 MPV 指令";
+  copyBtn.addEventListener("mouseenter", () => {
+    copyBtn.style.transform = "scale(1.15)";
+    copyBtn.style.boxShadow = "0 4px 20px rgba(108,92,231,0.6)";
+  });
+  copyBtn.addEventListener("mouseleave", () => {
+    copyBtn.style.transform = "scale(1)";
+    copyBtn.style.boxShadow = "0 2px 12px rgba(108,92,231,0.4)";
+  });
+  copyBtn.addEventListener("click", handleClick);
+  document.body.appendChild(copyBtn);
+
+  // Fade in animation
   requestAnimationFrame(() => {
-    btn.style.opacity = "1";
+    playBtn.style.opacity = "1";
+    copyBtn.style.opacity = "1";
   });
 }
 
-function hideButton() {
-  const btn = document.getElementById("biliver-btn");
-  if (btn) btn.remove();
+function hideButtons() {
+  const playBtn = document.getElementById("biliver-play-btn");
+  const copyBtn = document.getElementById("biliver-copy-btn");
+  if (playBtn) playBtn.remove();
+  if (copyBtn) copyBtn.remove();
 }
 
 // ===================== 页面检测 =====================
@@ -686,13 +841,13 @@ function isBilibiliPage(url) {
 async function detectAndShow() {
   const url = location.href;
   if (!isBilibiliPage(url)) {
-    hideButton();
+    hideButtons();
     return;
   }
 
   // 直播页面直接显示按钮（直播流随时可用）
   if (url.includes("live.bilibili.com")) {
-    showButton();
+    showButtons();
     return;
   }
 
@@ -707,7 +862,7 @@ async function detectAndShow() {
         if (!info) info = await getVideoInfoByBvid(url);
       }
       if (info?.aid && info?.cid) {
-        showButton();
+        showButtons();
         return;
       }
     } catch (_) {}
@@ -723,7 +878,7 @@ function onUrlChange() {
   const newUrl = location.href;
   if (newUrl !== _lastUrl) {
     _lastUrl = newUrl;
-    hideButton();
+    hideButtons();
     detectAndShow();
   }
 }

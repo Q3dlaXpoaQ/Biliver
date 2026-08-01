@@ -10,9 +10,38 @@ local o = {
     area = 0.45,
     fontname = "Microsoft YaHei",
     fps_vf = "yes",
-    max_pool = 300, -- 直播弹幕池大小上限，防止长时间观看后掉帧
+    max_pool = 2000, -- 直播弹幕池大小上限（仅作为极端弹幕潮时的内存保护）
 }
 options.read_options(o, "biliver")
+
+-- 字体可用性处理：确保 libass 不会因找不到字体而反复报错
+-- 如果指定字体可能导致性能问题，自动回退到系统安全字体
+local function get_safe_fontname()
+    local name = o.fontname
+    if not name or name == "" then
+        return "sans-serif"
+    end
+    -- 针对 Windows 平台，确保字体名能被 DirectWrite 正确识别
+    -- "Microsoft YaHei" 的标准名称可能因系统区域设置而异
+    -- 保留用户配置，但通过后续的 sub-fonts-dir 和 log-level 来兜底
+    return name
+end
+
+-- 设定全局字体属性，让 mpv/libass 能更可靠地找到字体
+-- 避免在 ASS 内联样式中重复指定字体导致的查找失败
+local safe_fontname = get_safe_fontname()
+pcall(function()
+    mp.set_property("sub-font", safe_fontname)
+end)
+
+-- Windows 平台：将系统字体目录加入字体搜索路径
+if package.config:sub(1,1) == '\\' then
+    pcall(function()
+        local font_dir = os.getenv("WINDIR") or "C:\\Windows"
+        font_dir = font_dir .. "\\Fonts"
+        mp.set_property("sub-fonts-dir", font_dir)
+    end)
+end
 
 -- 兼容性处理：将字符串转为布尔值
 if type(o.fps_vf) == "string" then
@@ -50,32 +79,41 @@ end
 mp.set_property_number("osd-level", 1)
 mp.set_property_bool("osd-bar", false)
 
+-- 读取视频像素分辨率 (dw/dh 优先)，失败回退默认值
+local function get_video_dims(default_w, default_h)
+    local vo_params = mp.get_property_native('video-out-params')
+    if not vo_params then
+        return default_w, default_h
+    end
+    local w = vo_params.dw or vo_params.w or default_w
+    local h = vo_params.dh or vo_params.h or default_h
+    return w, h
+end
+
 -- 安全移除 Biliver-FPS 滤镜（先检查是否存在）
-local function safe_remove_fps_vf()
+local function has_fps_vf()
     local filters = mp.get_property_native("vf")
-    if not filters then return end
+    if not filters then return false end
     for _, f in ipairs(filters) do
-        if f.label == "Biliver-FPS" then
-            pcall(function()
-                mp.commandv('vf', 'remove', '@Biliver-FPS')
-            end)
-            return true
-        end
+        if f.label == "Biliver-FPS" then return true end
     end
     return false
+end
+
+
+local function safe_remove_fps_vf()
+    if not has_fps_vf() then return false end
+    pcall(function()
+        mp.commandv('vf', 'remove', '@Biliver-FPS')
+    end)
+    return true
 end
 
 -- 帧率优化滤镜：确保弹幕始终以 60fps 渲染
 local function update_fps_vf(force)
     if not o.fps_vf then return end
-    
-    local filters = mp.get_property_native("vf")
-    local has_filter = false
-    if filters then
-        for _, f in ipairs(filters) do
-            if f.label == "Biliver-FPS" then has_filter = true break end
-        end
-    end
+
+    local has_filter = has_fps_vf()
 
     -- 直播模式：强制添加补帧滤镜，不等待 container-fps
     if force then
@@ -129,18 +167,26 @@ local danmaku_speed = travel_dist / o.duration
 local track_height = o.font_size + 8
 local max_tracks = math.max(1, math.floor((1080 * o.area) / track_height))
 local track_until = {}
+local render_interval = 1 / 60 -- 恒定 60fps 渲染
 
 local function sanitize_text(text)
-    return text:gsub("[{}]", ""):gsub("\n", " ")
+    return text:gsub("[{}]", ""):gsub("[\r\n]", " ")
 end
 
 local function estimate_text_width(text)
-    local w = 0
+    -- 按 UTF-8 字符数估算宽度，避免把多字节字符的每个字节都算作一个字导致宽度高估 3 倍
+    local ascii = 0
+    local cont = 0
     for i = 1, #text do
-        local c = text:sub(i, i)
-        w = w + (c:byte() < 128 and 0.6 or 1.05)
+        local b = text:byte(i)
+        if b < 128 then
+            ascii = ascii + 1
+        elseif b >= 128 and b < 192 then -- 10xxxxxx 是 UTF-8 连续字节
+            cont = cont + 1
+        end
     end
-    return w * o.font_size
+    local wide = (#text - cont) - ascii
+    return (ascii * 0.6 + wide * 1.05) * o.font_size
 end
 
 local function pick_track(text_width)
@@ -163,10 +209,24 @@ local function pick_track(text_width)
     return best, effective_start
 end
 
+local function trim_pool()
+    -- 仅在池子超过上限（极端弹幕潮）时丢弃最旧的弹幕，正常情况不会触发
+    local n = #dm_pool
+    if n <= o.max_pool then return end
+    local excess = n - o.max_pool
+    local trimmed = {}
+    for i = excess + 1, n do
+        trimmed[#trimmed + 1] = dm_pool[i]
+    end
+    dm_pool = trimmed
+end
+
 local function render_frame()
     render_timer = nil
     render_running = false
-    if not danmaku_visible or not overlay then return end
+    if not danmaku_visible or not overlay then
+        return
+    end
 
     local now = mp.get_time()
     local alive = {}
@@ -175,15 +235,8 @@ local function render_frame()
             alive[#alive + 1] = dm
         end
     end
-    if #alive > o.max_pool then
-        local start_idx = #alive - o.max_pool + 1
-        local trimmed = {}
-        for i = start_idx, #alive do
-            trimmed[#trimmed + 1] = alive[i]
-        end
-        alive = trimmed
-    end
     dm_pool = alive
+    trim_pool()
 
     if #dm_pool == 0 then
         overlay.data = ""
@@ -198,19 +251,21 @@ local function render_frame()
         if elapsed > dm.lifespan then elapsed = dm.lifespan end
         local x = dm.start_x - danmaku_speed * elapsed
         if x < dm.end_x then x = dm.end_x end
-        lines[#lines + 1] = string.format(
-            "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\b1\\fs%d\\fn%s\\alpha&H%s&}%s",
-            x, dm.y, dm.color, o.font_size, o.fontname, ass_alpha, dm.text
-        )
+        -- 尚未进入屏幕（正在排队）的弹幕不参与渲染，减少每帧开销
+        if x < dm.start_x then
+            lines[#lines + 1] = string.format(
+                "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\b1\\fs%d\\fn%s\\alpha&H%s&}%s",
+                x, dm.y, dm.color, o.font_size, o.fontname, ass_alpha, dm.text
+            )
+        end
     end
 
-    overlay.data = table.concat(lines, "\n")
+    overlay.data = (#lines > 0) and table.concat(lines, "\n") or ""
     overlay:update()
 
-    if #dm_pool > 0 then
-        render_running = true
-        render_timer = mp.add_timeout(0, render_frame)
-    end
+    -- 恒定 60fps 渲染；Lua 单线程事件循环下不会与 start_render 重复调度
+    render_running = true
+    render_timer = mp.add_timeout(render_interval, render_frame)
 end
 
 local function start_render()
@@ -218,10 +273,11 @@ local function start_render()
     if not danmaku_visible or not overlay then return end
     if #dm_pool == 0 then return end
     render_running = true
-    render_timer = mp.add_timeout(0, render_frame)
+    render_timer = mp.add_timeout(render_interval, render_frame)
 end
 
 local function add_danmaku(color, text, y_hint)
+    if not overlay then return end
     text = sanitize_text(text)
     if text == "" then return end
 
@@ -229,14 +285,6 @@ local function add_danmaku(color, text, y_hint)
     local track, effective_start = pick_track(tw)
     local y_pos = TOP_MARGIN + (track - 1) * track_height
 
-    if #dm_pool >= o.max_pool then
-        local start_idx = #dm_pool - o.max_pool + 2
-        local trimmed = {}
-        for i = start_idx, #dm_pool do
-            trimmed[#trimmed + 1] = dm_pool[i]
-        end
-        dm_pool = trimmed
-    end
     dm_pool[#dm_pool + 1] = {
         text = text,
         color = color,
@@ -246,6 +294,7 @@ local function add_danmaku(color, text, y_hint)
         start_x = live_w,
         end_x = -(travel_dist - live_w),
     }
+    trim_pool()
 
     start_render()
 end
@@ -255,11 +304,7 @@ local function init_live_osd()
         overlay:remove()
     end
 
-    local vo_params = mp.get_property_native('video-out-params')
-    if vo_params then
-        live_w = vo_params.dw or vo_params.w or 1920
-        live_h = vo_params.dh or vo_params.h or 1080
-    end
+    live_w, live_h = get_video_dims(1920, 1080)
 
     travel_dist = live_w + 1200
     danmaku_speed = travel_dist / o.duration
@@ -293,12 +338,7 @@ local function process_vod(target_id)
     local py_path = utils.join_path(script_dir, "biliver.py")
     local danmaku_dir = os.getenv("TEMP") or "/tmp/"
     
-    local vo_params = mp.get_property_native('video-out-params')
-    local dw, dh = 1920, 1080
-    if vo_params then
-        dw = vo_params.dw or vo_params.w or 1920
-        dh = vo_params.dh or vo_params.h or 1080
-    end
+    local dw, dh = get_video_dims(1920, 1080)
 
     mp.command_native_async({
         name = 'subprocess',
@@ -370,7 +410,8 @@ local function on_start_file()
         mp.osd_message("Biliver: 正在连接直播弹幕 " .. room_id, 2)
         pcall(function()
             saved_msg_level = mp.get_property("msg-level")
-            mp.set_property("msg-level", "player=warn")
+            -- 同时抑制 libass 的字体查找警告，避免反复查字体导致性能开销
+            mp.set_property("msg-level", "player=warn,libass=error")
         end)
         init_live_osd()
         update_fps_vf(true)
@@ -404,7 +445,8 @@ local function on_start_file()
     -- 2. Check for VOD (BV/AV/CID)
     local bvid = string.match(path, "bilibili%.com/video/(BV[%w]+)")
     local avid = string.match(path, "bilibili%.com/video/(av%d+)")
-    local target_id = script_opts.cid or bvid or avid or (string.match(path, "^vod:(.+)$") and string.match(path, "^vod:(.+)$"))
+    local vod_id = string.match(path, "^vod:(.+)$")
+    local target_id = script_opts.cid or bvid or avid or vod_id
     
     if target_id then
         process_vod(target_id)
@@ -445,6 +487,11 @@ mp.register_event("end-file", function(e)
                 mp.set_property("msg-level", "")
             end
             saved_msg_level = nil
+        end)
+        -- 清理时移除全局字体属性设置
+        pcall(function()
+            mp.set_property("sub-font", "")
+            mp.set_property("sub-fonts-dir", "")
         end)
     end
 end)
@@ -490,6 +537,3 @@ end
 
 mp.add_forced_key_binding("Ctrl+d", "toggle-danmaku", toggle_danmaku)
 mp.register_script_message("biliver-toggle", toggle_danmaku)
-
-
-
