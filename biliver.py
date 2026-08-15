@@ -428,7 +428,7 @@ def send_mpv_async(queue, cmd):
 
 
 # --- 4. 点播与入口 ---
-def run_vod(target_id, directory, size_str, font, fontsize, opacity_pct, area, duration=10.0):
+def run_vod(target_id, directory, size_str, font, fontsize, opacity_pct, area, duration=10.0, outline=2, shadow=1):
     cid = target_id
     if target_id.startswith("BV") or target_id.lower().startswith("av"):
         t, v = (
@@ -485,11 +485,11 @@ def run_vod(target_id, directory, size_str, font, fontsize, opacity_pct, area, d
 
         dm = DanmakuManager(w=w, h=h, area=area, fs=fontsize, dur=duration)
         alpha = f"{int((100 - float(opacity_pct)) * 2.55):02x}"
-        # 干净样式：无描边无阴影、对齐 7
+        # 白字 + 黑色描边/阴影（outline/shadow 可配 0 关闭），浅色背景可读
         ass_path = os.path.join(directory, f"danmaku_{target_id}.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(
-                f"[Script Info]\nPlayResX: {w}\nPlayResY: {h}\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginV, Encoding\nStyle: Default, {font}, {fontsize}, &H{alpha}FFFFFF, &H00000000, &H00000000, 1, 1, 0, 0, 7, 0, 1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                f"[Script Info]\nPlayResX: {w}\nPlayResY: {h}\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginV, Encoding\nStyle: Default, {font}, {fontsize}, &H{alpha}FFFFFF, &H{alpha}000000, &H{alpha}000000, 1, 1, {outline}, {shadow}, 7, 0, 1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
             )
             # 按时间排序以正确计算轨道
             danmakus = []
@@ -645,6 +645,9 @@ async def run_live(room_id, ipc_path, area, fs, duration=10.0, w=1920, h=1080):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Biliver Backend")
     subparsers = parser.add_subparsers(dest="mode", help="运行模式")
+    # verbose 必须对所有模式存在：vod 子命令未注册 -v 时，主解析器的默认值
+    # 会流入子命令的 namespace，避免第 685 行 args.verbose 缺失导致崩溃
+    parser.set_defaults(verbose=False)
 
     # 点播模式 (VOD)
     vod_parser = subparsers.add_parser("vod", help="点播弹幕转换")
@@ -664,6 +667,15 @@ if __name__ == "__main__":
     vod_parser.add_argument(
         "-dur", "--duration", type=float, default=10.0, help="弹幕滚动时长（秒）"
     )
+    vod_parser.add_argument(
+        "-ol", "--outline", type=int, default=2, help="描边宽度（像素），0=关闭"
+    )
+    vod_parser.add_argument(
+        "-sh", "--shadow", type=int, default=1, help="阴影宽度（像素），0=关闭"
+    )
+    vod_parser.add_argument(
+        "-v", "--verbose", action="store_true", help="输出 DEBUG 级日志（或设置环境变量 BILIVER_DEBUG=1）"
+    )
 
     # 直播模式 (Live)
     live_parser = subparsers.add_parser("live", help="直播弹幕实时渲染")
@@ -682,7 +694,7 @@ if __name__ == "__main__":
 
     if os.environ.get("BILIVER_DEBUG"):
         args.verbose = True
-    if args.verbose:
+    if getattr(args, "verbose", False):
         logger.setLevel(logging.DEBUG)
         _setup_console_handler(logging.DEBUG)
     else:
@@ -699,6 +711,8 @@ if __name__ == "__main__":
             args.opacity,
             args.area,
             args.duration,
+            args.outline,
+            args.shadow,
         )
     elif args.mode == "live":
         try:

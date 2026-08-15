@@ -120,7 +120,8 @@ start-file 事件
 overlay.data = 每行一个ASS事件, \n 分隔
 overlay:update()  →  原子替换整个覆盖层, 无闪烁
 
-每条弹幕 = {\an7\pos(x,y)\c&HBBGGRR&\bord0\shad0\b1\fs36\fn字体\alpha&HAA&}文字
+每条弹幕 = {\an7\pos(x,y)\c&HBBGGRR&\bordN\shadN\3c&H000000&\3a&HAA&\4c&H000000&\4a&HAA&\b1\fs36\fn字体\alpha&HAA&}文字
+（N = 配置 outline/shadow，浅色背景可加大；描边阴影黑色，透明度跟随 opacity）
 ```
 
 **渲染循环:**

@@ -79,6 +79,8 @@ MPV 播放器的 **Bilibili 弹幕插件** — 支持 VOD 点播 + 直播实时�
 | `opacity` | `60` | 不透明度 (0-100) |
 | `area` | `0.45` | 占屏幕高度比例 (0.0-1.0) |
 | `fps_vf` | `yes` | 60fps 补帧滤镜 |
+| `outline` | `2` | 弹幕描边宽度(px)，浅色背景看不清时加大；`0` 关闭 |
+| `shadow` | `1` | 弹幕阴影宽度(px)，`0` 关闭 |
 | `python_path` | `python` | Python 解释器路径 |
 | `max_pool` | `1000` | 直播弹幕池大小上限（仅极端弹幕潮时兜底，超出丢弃最旧条目） |
 
@@ -89,6 +91,8 @@ MPV 播放器的 **Bilibili 弹幕插件** — 支持 VOD 点播 + 直播实时�
 1. **后端日志** `biliver.log`（与 `biliver.py` 同目录）：查看 WebSocket 重连、IPC 写入失败、心跳异常。
 2. **mpv 控制台**：以 `--msg-level=biliver=trace` 启动，可看到 Lua 端事件（后端启动/退出/重启、弹幕接收计数）。
 3. **协议处理器日志** `%TEMP%\biliver_handler.log`：一键打开无反应时查看。
+
+浅色/白色背景视频弹幕看不清时：调大 `outline`（建议 2-4），或在 `biliver.conf` 中提高 `opacity`。
 
 设置环境变量 `BILIVER_DEBUG=1`（或给后端进程加 `--verbose`）可输出 DEBUG 级日志到 `biliver.log` 与 mpv 控制台。
 

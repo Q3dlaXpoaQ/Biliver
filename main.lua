@@ -10,6 +10,8 @@ local o = {
     area = 0.45,
     fontname = "Microsoft YaHei",
     fps_vf = "yes",
+    outline = 2, -- 描边宽度(px)，0=关闭；浅色背景看不清时加大
+    shadow = 1,  -- 阴影宽度(px)，0=关闭
     max_pool = 2000, -- 直播弹幕池大小上限（仅作为极端弹幕潮时的内存保护）
 }
 options.read_options(o, "biliver")
@@ -64,15 +66,31 @@ local danmu_file = nil
 local vod_danmaku_loaded = false
 
 -- 获取或设置 IPC Server
+-- 管道名必须按进程唯一：mpv 内嵌 LuaJIT 的 math.random 未播种时每次启动
+-- 产出同一序列（固定名），并发启动的多个 mpv 实例（如 Lively Wallpaper 等
+-- 常驻 mpv 与播放用 mpv 并存）会因同名命名管道冲突，后启动者报
+-- "Couldn't create first pipe instance: 拒绝访问 (0x80070005)"。
+-- 因此改用进程 PID 命名，实例间天然互不冲突。
 local ipc_server = mp.get_property("input-ipc-server")
 if not ipc_server or ipc_server == "" then
     local is_windows = package.config:sub(1,1) == '\\'
+    local pid = 0
+    pcall(function() pid = mp.getpid() or 0 end)
+    if pid == 0 then
+        -- 旧版 mpv 无 mp.getpid()：先用时间+时钟播种再取随机数兜底
+        math.randomseed(os.time() + math.floor(os.clock() * 1000))
+        pid = math.random(100000, 999999)
+    end
     if is_windows then
-        ipc_server = "\\\\.\\pipe\\mpv-biliver-" .. math.random(100000, 999999)
+        ipc_server = "\\\\.\\pipe\\mpv-biliver-" .. pid
     else
-        ipc_server = "/tmp/mpv-biliver-" .. math.random(100000, 999999) .. ".sock"
+        ipc_server = "/tmp/mpv-biliver-" .. pid .. ".sock"
     end
     mp.set_property("input-ipc-server", ipc_server)
+    -- 校验是否生效（个别构建/场景不支持运行时修改该选项），失败时明确提示
+    if mp.get_property("input-ipc-server") ~= ipc_server then
+        msg.warn("input-ipc-server 设置失败，直播弹幕将不可用: " .. tostring(ipc_server))
+    end
 end
 
 -- 强制开启 OSD 层级，但关闭内置进度条（避免与 modernz 冲突）
@@ -289,8 +307,8 @@ local function render_frame()
         -- 尚未进入屏幕（正在排队 / 时钟回退暂停）的弹幕不参与渲染，减少每帧开销
         if x < dm.start_x then
             lines[#lines + 1] = string.format(
-                "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\b1\\fs%d\\fn%s\\alpha&H%s&}%s",
-                x, dm.y, dm.color, o.font_size, o.fontname, ass_alpha, dm.text
+                "{\\an7\\pos(%.1f,%d)\\c%s\\bord%d\\shad%d\\3c&H000000&\\3a&H%s&\\4c&H000000&\\4a&H%s&\\b1\\fs%d\\fn%s\\alpha&H%s&}%s",
+                x, dm.y, dm.color, o.outline, o.shadow, ass_alpha, ass_alpha, o.font_size, o.fontname, ass_alpha, dm.text
             )
         end
     end
@@ -505,6 +523,8 @@ local function process_vod(target_id)
             "-o", tostring(o.opacity),
             "-a", tostring(o.area),
             "-dur", tostring(o.duration),
+            "-ol", tostring(o.outline),
+            "-sh", tostring(o.shadow),
             "-r", tostring(target_id)
         }
     }, function(success, res, err)
