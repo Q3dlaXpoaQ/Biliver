@@ -1,8 +1,8 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name                    Biliver Helper
 // @name:zh-CN              Biliver 助手
 // @namespace               https://github.com/biliver
-// @version                 1.0.0
+// @version                 1.2.0
 // @license                 MIT
 // @description             Extract Bilibili video/live CDN links and copy MPV command to clipboard
 // @description:zh-CN       提取B站视频/直播 CDN 链接并一键复制MPV 指令到剪贴板
@@ -114,16 +114,24 @@ function extractKeyCookies(cookieString) {
     const trimmed = pair.trim();
     if (!trimmed) continue;
 
-    const [name, value] = trimmed.split("=");
-    if (name && value) {
-      const cookieName = name.trim();
-      // 如果是关键 cookie 或者不是临时性 cookie，则保留
-      if (
-        keyCookies.includes(cookieName) ||
-        (!cookieName.includes("temp") && !cookieName.includes("session"))
-      ) {
-        cookies.push(`${cookieName}=${value}`);
-      }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const cookieName = trimmed.slice(0, eq).trim();
+    const cookieValue = trimmed.slice(eq + 1).trim();
+    if (!cookieValue) continue;
+
+    // 关键：mpv 的 --http-header-fields 按逗号分隔头部，Cookie 值若含逗号/引号/换行
+    // （如 B 站下发的 bmg_af_sc={"none":{"on":1,"def":"i1.hdslb.com"},...}）会被
+    // 切碎成非法请求头（如 "def: i1.hdslb.com}"），导致 CDN 拒绝请求（HTTP 400）
+    // 而 mpv 静默退出。此类 cookie 必须剔除，否则一键打开在部分浏览器上失效。
+    if (/[,;"\r\n]/.test(cookieValue)) continue;
+
+    // 如果是关键 cookie 或者不是临时性 cookie，则保留
+    if (
+      keyCookies.includes(cookieName) ||
+      (!cookieName.includes("temp") && !cookieName.includes("session"))
+    ) {
+      cookies.push(`${cookieName}=${cookieValue}`);
     }
   }
 
@@ -164,18 +172,50 @@ function buildEnhancedHeaders(media) {
 
   if (media.userAgent) headers.push(`User-Agent: ${media.userAgent}`);
 
-  // 只添加必要的头，避免 400 错误
+  // 只添加必要的头，避免 400 错误。
+  // 注意：这些头最终会进入 mpv 的 --http-header-fields（按逗号分隔），
+  // 因此值内不能含逗号（q= 权重、多值 Accept-Encoding 都会破坏解析）。
   headers.push("Accept: */*");
-  headers.push("Accept-Language: zh-CN,zh;q=0.9,en;q=0.8");
+  headers.push("Accept-Language: zh-CN");
   headers.push("Connection: keep-alive");
 
-  // 直播流需要额外的安全头
+  // 直播流需要额外的安全头（值均不含逗号）
   if (media.roomid) {
-    headers.push("Accept-Encoding: gzip, deflate, br");
+    headers.push("Accept-Encoding: gzip");
     headers.push("Cache-Control: no-cache");
   }
 
   return headers;
+}
+
+// mpv 的 --http-header-fields 按逗号分隔头部，且无法转义：
+// 值内含逗号/引号/换行的头部会被切碎成非法请求头（HTTP 400）。
+// 所有最终交给 mpv 的头部列表必须经过此清洗（防御性兜底）：
+//   - Cookie 头：按 ';' 拆对，剔除值含逗号/引号/换行的 cookie 对
+//     （如 bmg_af_sc={"none":{"on":1,...}}）；';' 本身合法，予以保留
+//   - 非 Cookie 头（如 UA 的 "(KHTML, like Gecko)"）：逗号替换为 ';'
+function sanitizeHeaderList(headers) {
+  const out = [];
+  for (const h of headers || []) {
+    if (typeof h !== "string") continue;
+    const s = h.trim();
+    if (!s) continue;
+    const idx = s.indexOf(":");
+    if (idx <= 0) continue;
+    const name = s.slice(0, idx).trim();
+    let value = s.slice(idx + 1).trim();
+    if (/[\r\n]/.test(value)) continue;
+    if (name.toLowerCase() === "cookie") {
+      const pairs = value
+        .split(";")
+        .map((p) => p.trim())
+        .filter((p) => p && !/[,;"\r\n]/.test(p));
+      if (pairs.length) out.push("Cookie: " + pairs.join("; "));
+    } else {
+      out.push(name + ": " + value.replace(/,/g, ";"));
+    }
+  }
+  return out;
 }
 
 // ===================== Bilibili 视频解析 =====================
@@ -509,6 +549,9 @@ function buildMpvCommand(media) {
     ].filter(Boolean);
   }
 
+  // 清洗头部：剔除值含逗号/引号/换行的头部（mpv 逗号分隔限制）
+  headers = sanitizeHeaderList(headers);
+
   const args = [
     "mpv",
     `"${media.video}"`,
@@ -528,10 +571,20 @@ function buildMpvCommand(media) {
 }
 
 function copyToClipboard(text) {
-  if (typeof GM_setClipboard !== "undefined") {
-    GM_setClipboard(text);
-  } else {
-    navigator.clipboard.writeText(text);
+  // 任何剪贴板写入失败都不应阻断后续的一键启动流程（launchViaProtocol）
+  try {
+    if (typeof GM_setClipboard !== "undefined") {
+      GM_setClipboard(text);
+      return;
+    }
+  } catch (_) {
+    // 回退到 Clipboard API
+  }
+  try {
+    const p = navigator.clipboard.writeText(text);
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch (_) {
+    // 静默失败：处理器会提示"未能读取到播放信息"
   }
 }
 
@@ -598,7 +651,7 @@ async function handleClick() {
       media.title = info.title || document.title;
       media.origin = "https://www.bilibili.com";
       media.referer = "https://www.bilibili.com/";
-      media.cookie = document.cookie;
+      media.cookie = enhanceCookieString(document.cookie);
       media.userAgent = navigator.userAgent;
 
       // 尝试获取播放进度
@@ -684,7 +737,7 @@ async function handlePlayClick() {
       media.title = info.title || document.title;
       media.origin = "https://www.bilibili.com";
       media.referer = "https://www.bilibili.com/";
-      media.cookie = document.cookie;
+      media.cookie = enhanceCookieString(document.cookie);
       media.userAgent = navigator.userAgent;
 
       try {
@@ -695,16 +748,24 @@ async function handlePlayClick() {
 
     if (!media.video) throw new Error("解析失败：未获取到视频地址");
 
-    const params = new URLSearchParams();
-    params.set("url", media.video);
-    params.set("headers", buildHeaderString(media));
-    if (media.cid) params.set("cid", media.cid);
-    if (media.roomid) params.set("roomid", media.roomid);
-    if (media.title) params.set("title", media.title);
-    if (media.time) params.set("start", media.time);
-
-    window.location.href = "biliver://mpv?" + params.toString();
-    showToast("正在启动 MPV...");
+    // 一键播放：payload（含 cookie 等）写入剪贴板，协议 URL 只携带短 token，
+    // 避免长 URL 被旧浏览器截断（cookie + 音视频签名 URL 可达数 KB）。
+    const token =
+      Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    const payload = {
+      k: token,
+      t: Date.now(),
+      url: media.video,
+      audio: media.audio || "",
+      headers: buildHeaderString(media),
+      cid: media.cid || "",
+      roomid: media.roomid || "",
+      title: media.title || "",
+      start: media.time || "",
+    };
+    copyToClipboard(JSON.stringify(payload));
+    showToast("正在启动 MPV...请勿复制其他内容", 3000);
+    launchViaProtocol(token);
 
     try {
       document.querySelectorAll("video").forEach((v) => v.pause());
@@ -723,10 +784,8 @@ function buildHeaderString(media) {
     if (!headers.some((h) => h.startsWith("Referer:"))) headers.push("Referer: https://live.bilibili.com/");
     if (!headers.some((h) => h.startsWith("User-Agent:"))) headers.push(`User-Agent: ${getSafeUA()}`);
     headers.push("Accept: */*");
-    headers.push("Accept-Language: zh-CN,zh;q=0.9,en;q=0.8");
+    headers.push("Accept-Language: zh-CN");
     headers.push("Connection: keep-alive");
-    headers.push("Accept-Encoding: gzip, deflate, br");
-    headers.push("Cache-Control: no-cache");
   } else {
     headers.push(media.origin ? `Origin: ${media.origin}` : "");
     headers.push(media.referer ? `Referer: ${media.referer}` : "");
@@ -736,7 +795,48 @@ function buildHeaderString(media) {
     headers.push("Accept-Language: zh-CN");
     headers.push("Connection: keep-alive");
   }
-  return headers.filter(Boolean).join(",");
+  // 清洗头部：剔除值含逗号/引号/换行的头部（mpv 逗号分隔限制）
+  return sanitizeHeaderList(headers).join(",");
+}
+
+// ===================== 一键启动 MPV =====================
+function launchViaProtocol(token) {
+  // 检测逻辑：协议注册成功时，浏览器会弹“打开 Biliver？”确认框，用户确认后
+  // pythonw + mpv 启动（约 0.5~2s），mpv 窗口出现时浏览器必然失焦。
+  // 因此轮询 document.hasFocus() 是最可靠信号；窗口失焦即视为已启动。
+  // 检测窗口给到 4s，覆盖冷启动与慢确认，避免 1.5s 竞态导致的误报。
+  const CHECK_MS = 4000;
+  const start = Date.now();
+  let opened = false;
+  const markOpened = () => {
+    opened = true;
+  };
+  window.addEventListener("blur", markOpened);
+  const onVisibility = () => {
+    if (document.hidden) markOpened();
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+
+  try {
+    window.location.href = "biliver://mpv?k=" + token;
+  } catch (_) {
+    // 某些浏览器对未知协议导航可能抛错，交由轮询判定
+  }
+
+  const timer = setInterval(() => {
+    if (!document.hasFocus()) markOpened();
+    if (opened || Date.now() - start >= CHECK_MS) {
+      clearInterval(timer);
+      window.removeEventListener("blur", markOpened);
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (!opened) {
+        showToast(
+          "MPV 未打开？请确认已运行 install.bat 注册 biliver:// 协议；或改用复制指令按钮",
+          5000,
+        );
+      }
+    }
+  }, 150);
 }
 
 // ===================== 按钮 UI =====================

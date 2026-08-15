@@ -158,6 +158,7 @@ local travel_dist = 1920 + 1200
 
 local overlay = nil
 local dm_pool = {}
+local danmaku_received = 0 -- 诊断用累计接收计数
 local render_timer = nil
 local render_running = false
 local saved_msg_level = nil
@@ -167,7 +168,23 @@ local danmaku_speed = travel_dist / o.duration
 local track_height = o.font_size + 8
 local max_tracks = math.max(1, math.floor((1080 * o.area) / track_height))
 local track_until = {}
-local render_interval = 1 / 60 -- 恒定 60fps 渲染
+local render_period = 1 / 60 -- OSD 渲染周期（默认 60Hz，有显示器信息时提升到 120Hz）
+
+-- 依据显示/垂直同步信息调整渲染周期：OSD 更新应快于视频帧率，
+-- 否则 Lua 60Hz 定时器与视频帧率之间的拍频会造成周期性"卡一下"
+local function refresh_render_period()
+    local p = 1 / 60
+    local vi = mp.get_property_number("vsync-interval")
+    local df = mp.get_property_number("display-fps")
+    if vi and vi > 0.001 and vi < 0.05 then
+        p = vi / 2
+    elseif df and df > 30 and df < 300 then
+        p = 1 / df / 2
+    end
+    render_period = math.max(1 / 120, p)
+end
+mp.observe_property("display-fps", nil, refresh_render_period)
+mp.observe_property("vsync-interval", nil, refresh_render_period)
 
 local function sanitize_text(text)
     return text:gsub("[{}]", ""):gsub("[\r\n]", " ")
@@ -189,8 +206,19 @@ local function estimate_text_width(text)
     return (ascii * 0.6 + wide * 1.05) * o.font_size
 end
 
+-- 弹幕时钟：优先跟随视频时间轴 (time-pos)，直播无有效 time-pos 时退回墙钟。
+-- 关键：视频卡顿/重同步时画面跳变，若弹幕仍按墙钟走就会与画面产生相对偏移，
+-- 表现为"弹幕往后退/快进"。跟随视频时间轴后，画面跳、弹幕同步跳，二者永不失步。
+local function danmaku_clock()
+    local tp = mp.get_property_number("time-pos")
+    if tp and tp > 0 and tp < 1e7 then
+        return tp
+    end
+    return mp.get_time()
+end
+
 local function pick_track(text_width)
-    local now = mp.get_time()
+    local now = danmaku_clock()
     local travel_time = text_width / danmaku_speed + 0.2
     for i = 1, max_tracks do
         if now >= (track_until[i] or 0) then
@@ -228,12 +256,20 @@ local function render_frame()
         return
     end
 
-    local now = mp.get_time()
+    local now = danmaku_clock()
     local alive = {}
     for _, dm in ipairs(dm_pool) do
-        if now - dm.born < dm.lifespan then
+        -- 每条弹幕的 elapsed 单调非减：即使 mp.get_time() 回退
+        -- （直播流时钟重同步等），弹幕也只暂停、绝不后退
+        local el = now - dm.born
+        if dm.elapsed ~= nil and el < dm.elapsed then
+            el = dm.elapsed
+        end
+        if el < dm.lifespan then
+            dm.elapsed = el
             alive[#alive + 1] = dm
         end
+        -- 过期弹幕（el >= lifespan）直接移除
     end
     dm_pool = alive
     trim_pool()
@@ -246,12 +282,11 @@ local function render_frame()
 
     local lines = {}
     for _, dm in ipairs(dm_pool) do
-        local elapsed = now - dm.born
+        local elapsed = dm.elapsed or 0
         if elapsed < 0 then elapsed = 0 end
-        if elapsed > dm.lifespan then elapsed = dm.lifespan end
         local x = dm.start_x - danmaku_speed * elapsed
         if x < dm.end_x then x = dm.end_x end
-        -- 尚未进入屏幕（正在排队）的弹幕不参与渲染，减少每帧开销
+        -- 尚未进入屏幕（正在排队 / 时钟回退暂停）的弹幕不参与渲染，减少每帧开销
         if x < dm.start_x then
             lines[#lines + 1] = string.format(
                 "{\\an7\\pos(%.1f,%d)\\c%s\\bord0\\shad0\\b1\\fs%d\\fn%s\\alpha&H%s&}%s",
@@ -263,23 +298,29 @@ local function render_frame()
     overlay.data = (#lines > 0) and table.concat(lines, "\n") or ""
     overlay:update()
 
-    -- 恒定 60fps 渲染；Lua 单线程事件循环下不会与 start_render 重复调度
+    -- 渲染周期：默认 60Hz，有显示/垂直同步信息时提升到 120Hz（见 refresh_render_period）
     render_running = true
-    render_timer = mp.add_timeout(render_interval, render_frame)
+    render_timer = mp.add_timeout(render_period, render_frame)
 end
 
 local function start_render()
-    if render_running then return end
     if not danmaku_visible or not overlay then return end
     if #dm_pool == 0 then return end
+    -- 自愈：即使 render_running 标记残留为 true 而定时器已丢失，也重新调度
+    if render_running and render_timer then return end
     render_running = true
-    render_timer = mp.add_timeout(render_interval, render_frame)
+    render_timer = mp.add_timeout(render_period, render_frame)
 end
 
 local function add_danmaku(color, text, y_hint)
     if not overlay then return end
     text = sanitize_text(text)
     if text == "" then return end
+
+    danmaku_received = danmaku_received + 1
+    if danmaku_received % 200 == 0 then
+        msg.verbose(string.format("已接收 %d 条弹幕，当前池: %d", danmaku_received, #dm_pool))
+    end
 
     local tw = estimate_text_width(text)
     local track, effective_start = pick_track(tw)
@@ -291,6 +332,7 @@ local function add_danmaku(color, text, y_hint)
         y = y_pos,
         born = effective_start,
         lifespan = o.duration,
+        elapsed = nil, -- 单调 elapsed：时钟回退时保持位置，绝不后退
         start_x = live_w,
         end_x = -(travel_dist - live_w),
     }
@@ -327,6 +369,116 @@ local function init_live_osd()
 end
 
 mp.register_script_message("biliver-danmaku", add_danmaku)
+
+-- 后端空闲保活探测：Python 端在持久 IPC 连接上定期发送（无操作），
+-- 用于检测连接活性，不新增连接、不产生响应回写
+mp.register_script_message("biliver-keepalive", function() end)
+
+-- 直播后端进程看护：后端意外退出时自动重启，避免弹幕静默消失
+local live_active = false
+local live_gen = 0
+local live_restart_attempt = 0
+local live_restart_delay = 2
+local live_backend_started_at = 0
+
+-- 视频分辨率切换（直播流断流重连/画质切换）时，mpv 会把 OSD overlay 等比
+-- 缩放到新的视频尺寸：若不处理，全体弹幕会瞬间位移（看起来像"集体回退"）。
+-- 这里把 overlay 分辨率 & 现有弹幕按比例迁移到新坐标系，保持相对位置不变。
+local function rescale_live_overlay()
+    if not overlay or not live_active then return end
+    local nw, nh = get_video_dims(live_w, live_h)
+    if nw <= 0 or nh <= 0 or (nw == live_w and nh == live_h) then return end
+
+    local old_w, old_h = live_w, live_h
+    local sx, sy = nw / old_w, nh / old_h
+    local old_speed = danmaku_speed
+
+    -- 先记录每条弹幕在旧坐标系下的当前 x，再等比迁移
+    for _, dm in ipairs(dm_pool) do
+        dm.y = math.floor(dm.y * sy)
+        if dm.elapsed and dm.elapsed > 0 then
+            local x_old = dm.start_x - old_speed * dm.elapsed
+            dm._x_scaled = x_old * sx
+        end
+    end
+
+    live_w, live_h = nw, nh
+    travel_dist = live_w + 1200
+    danmaku_speed = travel_dist / o.duration
+    max_tracks = math.max(1, math.floor((live_h * o.area) / track_height))
+    overlay.res_x, overlay.res_y = nw, nh
+
+    for _, dm in ipairs(dm_pool) do
+        dm.start_x = live_w
+        dm.end_x = -(travel_dist - live_w)
+        local target_x = dm._x_scaled
+        dm._x_scaled = nil
+        if target_x and dm.elapsed then
+            -- 反推新坐标系下的 elapsed，使 mid-flight 弹幕移到等比例位置
+            dm.elapsed = math.max(0, (dm.start_x - target_x) / danmaku_speed)
+        end
+    end
+    msg.info(string.format("视频分辨率变化 %dx%d -> %dx%d，弹幕已等比迁移", old_w, old_h, nw, nh))
+end
+mp.observe_property("video-out-params", "native", rescale_live_overlay)
+
+local function start_live_backend(room_id)
+    if not live_active then return end
+    live_gen = live_gen + 1
+    local my_gen = live_gen
+    local script_dir = mp.get_script_directory() or "."
+    local backend_path = utils.join_path(script_dir, "biliver.py")
+    live_backend_started_at = mp.get_time()
+
+    msg.info("启动直播弹幕后端: " .. backend_path)
+    backend_process = mp.command_native_async({
+        name = "subprocess",
+        args = {o.python_path, backend_path, "live", room_id, ipc_server, tostring(o.area), tostring(o.font_size), tostring(o.duration), "--width", tostring(live_w), "--height", tostring(live_h)},
+        playback_only = false,
+    }, function(success, res, err)
+        -- 代数不匹配：回调属于已被取代/清理的旧后端，忽略
+        if my_gen ~= live_gen then
+            return
+        end
+        backend_process = nil
+
+        local killed_by_us = (res and res.killed_by_us) or false
+        local exit_code = (res and res.status) or -1
+        if success then
+            if exit_code == 0 then
+                msg.info("Backend exited normally.")
+            else
+                msg.warn("Backend exited with code: " .. tostring(exit_code))
+            end
+        else
+            if killed_by_us then
+                msg.verbose("Backend was stopped by us (normal).")
+            else
+                msg.warn("Backend subprocess error: " .. tostring(err or "unknown"))
+            end
+        end
+
+        -- 看护重启：仅当直播仍活跃且不是我们主动停止时
+        if not live_active or killed_by_us then return end
+
+        -- 后端稳定运行超过 60 秒则重置退避计数
+        if (mp.get_time() - live_backend_started_at) > 60 then
+            live_restart_attempt = 0
+            live_restart_delay = 2
+        end
+        if live_restart_attempt >= 6 then
+            msg.error("直播弹幕后端多次崩溃，停止自动重启（请查看 biliver.log 排查）")
+            return
+        end
+        live_restart_attempt = live_restart_attempt + 1
+        msg.warn(string.format("后端意外退出，%.0f 秒后自动重启 (第 %d 次)", live_restart_delay, live_restart_attempt))
+        mp.add_timeout(live_restart_delay, function()
+            if not live_active then return end
+            start_live_backend(room_id)
+        end)
+        live_restart_delay = math.min(live_restart_delay * 2, 30)
+    end)
+end
 
 -- VOD Danmaku Processing
 local function process_vod(target_id)
@@ -396,6 +548,9 @@ local function on_start_file()
         mp.abort_async_command(backend_process)
         backend_process = nil
     end
+    -- 作废旧直播看护状态，避免旧后端回调触发重启
+    live_active = false
+    live_gen = live_gen + 1
     
     -- 尝试关闭滤镜
     safe_remove_fps_vf()
@@ -415,30 +570,10 @@ local function on_start_file()
         end)
         init_live_osd()
         update_fps_vf(true)
-        local script_dir = mp.get_script_directory() or "."
-        local backend_path = utils.join_path(script_dir, "biliver.py")
-        backend_process = mp.command_native_async({
-            name = "subprocess",
-            args = {o.python_path, backend_path, "live", tostring(room_id), ipc_server, tostring(o.area), tostring(o.font_size), tostring(o.duration), "--width", tostring(live_w), "--height", tostring(live_h)},
-            playback_only = false,
-        }, function(success, res, err)
-            -- subprocess 被 abort 时 success=false 且 res.killed_by_us=true，这是正常行为
-            if success then
-                local exit_code = (res and res.status) or -1
-                if exit_code == 0 then
-                    msg.info("Backend exited normally.")
-                else
-                    msg.warn("Backend exited with code: " .. tostring(exit_code))
-                end
-            else
-                if res and res.killed_by_us then
-                    msg.verbose("Backend was stopped by us (normal).")
-                else
-                    msg.warn("Backend subprocess error: " .. tostring(err or "unknown"))
-                end
-            end
-            backend_process = nil
-        end)
+        live_active = true
+        live_restart_attempt = 0
+        live_restart_delay = 2
+        start_live_backend(tostring(room_id))
         return
     end
 
@@ -458,6 +593,10 @@ mp.register_event("start-file", on_start_file)
 mp.register_event("end-file", function(e)
     if not e then return end
     if e.reason == "stop" or e.reason == "quit" or e.reason == "eof" or e.reason == "error" then
+        msg.verbose("end-file: reason=" .. tostring(e.reason))
+        -- 先取消看护并作废在途回调，避免清理期间触发后端重启
+        live_active = false
+        live_gen = live_gen + 1
         if backend_process then
             msg.verbose("end-file: stopping backend process")
             mp.abort_async_command(backend_process)

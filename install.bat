@@ -25,7 +25,8 @@ param(
     [string]$MpvPath,
     [switch]$Silent,
     [switch]$NoBackup,
-    [switch]$UseMirror
+    [switch]$UseMirror,
+    [switch]$NoProtocol
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +34,7 @@ $ProgressPreference    = 'SilentlyContinue'
 
 $ScriptName    = 'Biliver Installer'
 $ScriptVersion = '3.0.0'
-$RequiredFiles = @('main.lua', 'biliver.py', 'biliver.js', 'biliver.conf')
+$RequiredFiles = @('main.lua', 'biliver.py', 'biliver.js', 'biliver.conf', 'biliver_handler.py')
 
 function Write-Step    { param([string]$Text) Write-Host "`n[>] $Text" -ForegroundColor Cyan }
 function Write-Ok      { param([string]$Text) Write-Host "  [OK] $Text" -ForegroundColor Green }
@@ -194,9 +195,10 @@ function Copy-PluginFiles {
         }
     }
     $fileMap = @(
-        @{ Source = 'main.lua';      DestDir = $scriptsDir },
-        @{ Source = 'biliver.py';    DestDir = $scriptsDir },
-        @{ Source = 'biliver.conf';  DestDir = $scriptOptsDir }
+        @{ Source = 'main.lua';            DestDir = $scriptsDir },
+        @{ Source = 'biliver.py';          DestDir = $scriptsDir },
+        @{ Source = 'biliver_handler.py';  DestDir = $scriptsDir },
+        @{ Source = 'biliver.conf';        DestDir = $scriptOptsDir }
     )
     $successCount = 0
     $failCount    = 0
@@ -340,6 +342,80 @@ function Check-Mpv {
     return $false
 }
 
+function Register-BiliverProtocol {
+    param([string]$HandlerPath)
+    Write-Step "Registering biliver:// protocol..."
+
+    $pythonCmd = Find-Python
+    if (-not $pythonCmd) {
+        Write-Warn "Python not found, cannot register biliver:// protocol"
+        Write-Info "  Run install.bat again after installing Python"
+        return $false
+    }
+
+    $parts = $pythonCmd -split '\s+'
+    $base  = $parts[0]
+    $prefix = @($parts | Select-Object -Skip 1)
+    $exePath = (Get-Command $base -ErrorAction SilentlyContinue).Source
+    if (-not $exePath) {
+        Write-Warn "Cannot resolve python executable: $pythonCmd"
+        return $false
+    }
+
+    # 优先使用 pythonw/pyw，避免处理器启动时黑框一闪
+    $dir = Split-Path $exePath -Parent
+    $leaf = Split-Path $exePath -Leaf
+    $windowless = $null
+    if ($leaf -like 'python*') {
+        $candidate = Join-Path $dir ($leaf -replace '^python', 'pythonw')
+        if (Test-Path $candidate) { $windowless = $candidate }
+    } elseif ($leaf -eq 'py.exe') {
+        $candidate = Join-Path $dir 'pyw.exe'
+        if (Test-Path $candidate) { $windowless = $candidate }
+    }
+    if (-not $windowless) { $windowless = $exePath }
+
+    $regRoot = 'HKCU:\Software\Classes\biliver'
+    New-Item -Path $regRoot -Force | Out-Null
+    New-Item -Path "$regRoot\DefaultIcon" -Force | Out-Null
+    New-Item -Path "$regRoot\shell\open\command" -Force | Out-Null
+    Set-ItemProperty -Path $regRoot -Name '(default)' -Value 'URL:Biliver Protocol' -Force
+    Set-ItemProperty -Path $regRoot -Name 'URL Protocol' -Value '' -Force
+    Set-ItemProperty -Path $regRoot -Name 'NoOpenWith' -Value '' -Force
+    Set-ItemProperty -Path "$regRoot\DefaultIcon" -Name '(default)' -Value "$handlerPath,0" -Force
+
+    $cmd = '"' + $windowless + '" ' + ($prefix -join ' ') + ' "' + $handlerPath + '" "%1"'
+    Set-ItemProperty -Path "$regRoot\shell\open\command" -Name '(default)' -Value $cmd -Force
+    Write-Ok "Protocol registered: biliver://"
+    Write-Info "  $cmd"
+
+    # 记录 mpv 路径，处理器优先使用，避免仅依赖 PATH
+    New-Item -Path 'HKCU:\Software\Biliver' -Force | Out-Null
+    $mpvCmd = Get-Command mpv.exe -ErrorAction SilentlyContinue
+    if (-not $mpvCmd) { $mpvCmd = Get-Command mpv -ErrorAction SilentlyContinue }
+    $mpvExe = $null
+    if ($mpvCmd) {
+        $src = $mpvCmd.Source
+        if ([IO.Path]::GetExtension($src) -eq '.com') {
+            $sibling = Join-Path (Split-Path $src) 'mpv.exe'
+            $mpvExe = if (Test-Path $sibling) { $sibling } else { $src }
+        } else {
+            $mpvExe = $src
+        }
+    }
+    if (-not $mpvExe) {
+        $default = Join-Path $env:APPDATA 'mpv\mpv.exe'
+        if (Test-Path $default) { $mpvExe = $default }
+    }
+    if ($mpvExe) {
+        Set-ItemProperty -Path 'HKCU:\Software\Biliver' -Name 'MpvPath' -Value $mpvExe -Force
+        Write-Ok "mpv path saved: $mpvExe"
+    } else {
+        Write-Warn "mpv not found in PATH; handler will search default locations"
+    }
+    return $true
+}
+
 function Show-Completion {
     param([string]$MpvDir, [string]$SrcDir)
     Write-Success "========================================"
@@ -349,6 +425,7 @@ function Show-Completion {
     Write-Host "Installed:" -ForegroundColor White
     Write-Info "  $(Join-Path $MpvDir 'scripts\biliver\main.lua')"
     Write-Info "  $(Join-Path $MpvDir 'scripts\biliver\biliver.py')"
+    Write-Info "  $(Join-Path $MpvDir 'scripts\biliver\biliver_handler.py')"
     Write-Info "  $(Join-Path $MpvDir 'script-opts\biliver.conf')"
     Write-Host ""
     Write-Host "Manual steps required:" -ForegroundColor Yellow
@@ -362,8 +439,9 @@ function Show-Completion {
     Write-Host "  3. (Recommended) Add to mpv.conf:" -ForegroundColor White
     Write-Info "     watch-later-options-remove=sub-pos"
     Write-Host ""
-    Write-Host "Usage: Click Biliver icon on Bilibili," -ForegroundColor White
-    Write-Info "       copy the generated command, run in terminal."
+    Write-Host "Usage: On a Bilibili page, click the play icon," -ForegroundColor White
+    Write-Info "       MPV opens directly (one-click, requires biliver:// protocol)."
+    Write-Info "       The copy button still works as a manual fallback."
     Write-Host ""
     Write-Host "Shortcut: Ctrl+D to toggle danmaku" -ForegroundColor White
     Write-Success "========================================"
@@ -388,6 +466,22 @@ function Main {
         exit 1
     }
     Copy-PluginFiles -SrcDir $srcDir -MpvDir $mpvDir | Out-Null
+    $scriptsDir = Join-Path $mpvDir 'scripts\biliver'
+    $handlerPath = Join-Path $scriptsDir 'biliver_handler.py'
+
+    $registerProtocol = $true
+    if ($NoProtocol) {
+        $registerProtocol = $false
+    } elseif (-not $Silent) {
+        $ans = Read-Host "  Register biliver:// protocol for one-click MPV? (Y/n)"
+        if ($ans -match '^[nN]') { $registerProtocol = $false }
+    }
+    if ($registerProtocol) {
+        Register-BiliverProtocol -HandlerPath $handlerPath | Out-Null
+    } else {
+        Write-Warn "Skipping biliver:// protocol registration (no one-click launch)"
+    }
+
     Check-PythonEnvironment | Out-Null
     Check-Mpv | Out-Null
     Show-Completion -MpvDir $mpvDir -SrcDir $srcDir

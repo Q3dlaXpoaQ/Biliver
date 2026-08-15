@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -34,6 +35,14 @@ logging.basicConfig(
     handlers=[logging.FileHandler(log_path, encoding="utf-8")],
 )
 logger = logging.getLogger("biliver")
+
+
+def _setup_console_handler(level):
+    # 控制台（stdout → mpv 控制台）输出：默认 WARNING 级，--verbose 时 DEBUG 级
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(ch)
 
 
 # --- 1. 协议定义 ---
@@ -83,8 +92,9 @@ class BLiveClient:
             "Referer": "https://www.bilibili.com/",
         }
         try:
+            req_timeout = aiohttp.ClientTimeout(total=15, connect=10)
             async with self._session.get(
-                self.ROOM_INIT_URL, params={"id": self._tmp_room_id}, headers=h
+                self.ROOM_INIT_URL, params={"id": self._tmp_room_id}, headers=h, timeout=req_timeout
             ) as res:
                 d = await res.json(content_type=None)
                 if d.get("code") != 0:
@@ -93,7 +103,7 @@ class BLiveClient:
 
             params = {"room_id": self._room_id, "platform": "pc", "player": "web"}
             async with self._session.get(
-                self.DANMAKU_SERVER_CONF_URL, params=params, headers=h
+                self.DANMAKU_SERVER_CONF_URL, params=params, headers=h, timeout=req_timeout
             ) as res:
                 d = await res.json(content_type=None)
                 if d.get("code") != 0:
@@ -122,7 +132,11 @@ class BLiveClient:
                 host = self._host_server_list[retry % len(self._host_server_list)]
                 url = f"wss://{host['host']}:{host.get('wss_port', 443)}/sub"
                 logger.info(f"正在连接弹幕服务器: {url}")
-                async with self._session.ws_connect(url, receive_timeout=90) as ws:
+                # 握手超时 10s；接收超时 60s（B 站心跳回复约 30s 一次，60s 足够宽松）。
+                # 旧版默认 90s/300s 会让"连接看似存活实则静默"的窗口过长
+                async with self._session.ws_connect(
+                    url, timeout=10, receive_timeout=60
+                ) as ws:
                     self._websocket = ws
                     auth = {
                         "uid": 0,
@@ -174,6 +188,7 @@ class BLiveClient:
         self._is_running = False
 
     async def _hb(self):
+        failures = 0
         while self._is_running and self._websocket:
             try:
                 # Bilibili 心跳包，body 为空即可，ver 设为 1
@@ -187,12 +202,19 @@ class BLiveClient:
                     )
                 )
                 # logger.debug("已发送心跳包")
+                failures = 0
                 await asyncio.sleep(25)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"心跳发送失败: {e}")
-                break
+                # 单次发送失败不应杀死心跳协程：短暂抖动后重试，
+                # 连续失败才放弃（等待服务端超时断开后走重连流程）
+                failures += 1
+                logger.warning(f"心跳发送失败(第 {failures} 次): {e}")
+                if failures >= 3:
+                    logger.error("心跳连续失败，放弃心跳，等待服务器断开后重连")
+                    break
+                await asyncio.sleep(1)
 
     def _make_p(self, d, op):
         b = json.dumps(d).encode("utf-8")
@@ -220,9 +242,13 @@ class BLiveClient:
                     try:
                         p = json.loads(b.decode("utf-8"))
                         if p.get("cmd", "").startswith("DANMU_MSG") and self.handler:
-                            # logger.debug(f"收到弹幕: {p['info'][1]}")
-                            self.handler(p["info"])
-                    except (json.JSONDecodeError, KeyError, IndexError, UnicodeDecodeError) as e:
+                            try:
+                                # logger.debug(f"收到弹幕: {p['info'][1]}")
+                                self.handler(p["info"])
+                            except Exception as e:
+                                # 单条弹幕处理失败只丢弃该条，绝不能中断本帧其余分包的解析
+                                logger.debug(f"弹幕回调处理失败: {e}")
+                    except (json.JSONDecodeError, KeyError, IndexError, UnicodeDecodeError, TypeError) as e:
                         logger.debug(f"解析弹幕消息失败: {e}")
                 o += h.pack_len
             except (struct.error, zlib.error) as e:
@@ -326,38 +352,57 @@ class IpcWriter:
         return self._file is not None
 
 
-def _ipc_ping(ipc_path):
-    # 通过一次性连接发送合法探测命令确认 mpv 存活（阻塞，请在 executor 中调用）
-    try:
-        with open(ipc_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"command": ["get_property", "volume"]}) + "\n")
-            f.flush()
-        return True
-    except OSError as e:
-        logger.warning(f"IPC 探测失败: {e}")
-        return False
+# 空闲保活写入的命令：Lua 端注册了同名 script-message（空操作），
+# 不会产生响应回写，避免填充 mpv 管道读缓冲。
+KEEPALIVE_CMD = ["script-message", "biliver-keepalive"]
+KEEPALIVE_SENTINEL = object()
 
 
-async def ipc_worker(queue, writer):
+async def ipc_worker(queue, writer, executor, shutdown_event, keepalive_interval=15.0):
+    # 持久连接写入协程：使用专用线程池（与旧版共用默认 executor 不同），
+    # 弹幕写入与任何其他阻塞任务互不争抢线程。
     loop = asyncio.get_running_loop()
+    connect_failures = 0
     while True:
-        cmd = await queue.get()
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
+            took_item = True
+        except asyncio.TimeoutError:
+            item = KEEPALIVE_SENTINEL
+            took_item = False
+
         try:
             if not writer.alive:
-                if not await loop.run_in_executor(None, writer.connect):
+                if await loop.run_in_executor(executor, writer.connect):
+                    connect_failures = 0
+                else:
+                    connect_failures += 1
+                    if connect_failures >= 20:
+                        logger.error("IPC 持续无法连接（mpv 可能已退出），后端退出")
+                        shutdown_event.set()
+                        return
                     await asyncio.sleep(0.5)
                     continue
-            if not await loop.run_in_executor(None, writer.write, cmd):
-                # 写失败：重连一次再试，仍失败则丢弃（避免队列卡死）
-                if await loop.run_in_executor(None, writer.connect):
-                    await loop.run_in_executor(None, writer.write, cmd)
+
+            if item is KEEPALIVE_SENTINEL:
+                # 空闲保活：在持久连接上写无操作命令，检测连接活性且不新增连接
+                item = KEEPALIVE_CMD
+                if not await loop.run_in_executor(executor, writer.write, item):
+                    logger.warning("空闲保活写入失败，尝试重连")
+                    await loop.run_in_executor(executor, writer.connect)
+            else:
+                if not await loop.run_in_executor(executor, writer.write, item):
+                    # 写失败：重连一次再试，仍失败则丢弃（避免队列卡死）
+                    if await loop.run_in_executor(executor, writer.connect):
+                        await loop.run_in_executor(executor, writer.write, item)
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"IPC Worker 异常: {e}")
             await asyncio.sleep(0.5)
         finally:
-            queue.task_done()
+            if took_item:
+                queue.task_done()
 
 
 def cleanup_queue(queue):
@@ -513,42 +558,22 @@ def run_vod(target_id, directory, size_str, font, fontsize, opacity_pct, area, d
         logger.error(f"点播转换失败: {traceback.format_exc()}")
 
 
-async def connection_monitor(shutdown_event, writer, ipc_path, idle_timeout=10, fail_threshold=3):
-    # 监控 mpv IPC 连接：弹幕空闲时周期性探测，连续多次失败才触发优雅关闭
-    loop = asyncio.get_running_loop()
-    consecutive_failures = 0
-    while True:
-        try:
-            if shutdown_event.is_set():
-                break
-            if time.monotonic() - writer.last_write_ok >= idle_timeout:
-                ok = await loop.run_in_executor(None, _ipc_ping, ipc_path)
-                consecutive_failures = 0 if ok else consecutive_failures + 1
-            else:
-                consecutive_failures = 0
-            if consecutive_failures >= fail_threshold:
-                logger.error(f"IPC 连接长时间不可用（连续 {consecutive_failures} 次探测失败），触发关闭")
-                shutdown_event.set()
-                break
-            await asyncio.sleep(3)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"连接监控异常: {e}")
-            break
-
-
 async def run_live(room_id, ipc_path, area, fs, duration=10.0, w=1920, h=1080):
     # 轨道布局由 Lua 端负责，Python 端只负责接收并转发弹幕
     writer = IpcWriter(ipc_path)
     ipc_queue = asyncio.Queue()
-    worker_task = asyncio.create_task(ipc_worker(ipc_queue, writer))
+    # 专用 IPC 线程池：写入与任何阻塞操作互不争抢线程，
+    # 避免弹幕稀疏时其他任务占满默认线程池导致写入饿死
+    ipc_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="biliver-ipc"
+    )
 
-    # 用于优雅关闭（必须在启动监控任务之前创建，以便传给 connection_monitor）
+    # 用于优雅关闭（mpv 退出时 Lua 端 abort 子进程；IPC 长期不可用时 ipc_worker 触发）
     shutdown_event = asyncio.Event()
 
-    # 启动连接监控任务
-    monitor_task = asyncio.create_task(connection_monitor(shutdown_event, writer, ipc_path))
+    worker_task = asyncio.create_task(
+        ipc_worker(ipc_queue, writer, ipc_executor, shutdown_event)
+    )
 
     def _signal_handler():
         logger.info("收到终止信号，正在关闭...")
@@ -562,42 +587,57 @@ async def run_live(room_id, ipc_path, area, fs, duration=10.0, w=1920, h=1080):
 
     def handle_danmaku(info):
         try:
-            color = info[0][3]
+            color_raw = info[0][3]
             text = info[1]
         except (IndexError, KeyError, TypeError):
             return
-        # 新版协议的长弹幕以 splits 分片下发，逐片渲染避免被截断
-        extra = info[0][15] if len(info[0]) > 15 and isinstance(info[0][15], dict) else {}
-        splits = extra.get("splits") or []
-        texts = [s for s in splits if s and s.strip()] if splits else [text]
-        color_arg = f"&H{color & 0xFF:02x}{(color >> 8) & 0xFF:02x}{(color >> 16) & 0xFF:02x}&"
-        for t in texts:
-            send_mpv_async(ipc_queue, [
-                "script-message",
-                "biliver-danmaku",
-                color_arg,
-                t,
-                "0",
-            ])
+        try:
+            # B 站颜色字段通常为 int，个别消息可能为字符串，做类型兜底
+            color = int(color_raw)
+        except (TypeError, ValueError):
+            color = 0xFFFFFF
+        try:
+            # 新版协议的长弹幕以 splits 分片下发，逐片渲染避免被截断
+            extra = (
+                info[0][15]
+                if len(info[0]) > 15 and isinstance(info[0][15], dict)
+                else {}
+            )
+            splits = extra.get("splits") or []
+            texts = [s for s in splits if s and s.strip()] if splits else [text]
+            color_arg = (
+                f"&H{color & 0xFF:02x}{(color >> 8) & 0xFF:02x}"
+                f"{(color >> 16) & 0xFF:02x}&"
+            )
+            for t in texts:
+                send_mpv_async(ipc_queue, [
+                    "script-message",
+                    "biliver-danmaku",
+                    color_arg,
+                    t,
+                    "0",
+                ])
+        except Exception as e:
+            logger.debug(f"处理弹幕消息异常: {e}")
 
     try:
+        # 注意：不要在 session 上设 total 超时 —— aiohttp 的 total 可能与
+        # WebSocket 接收超时互相干扰导致周期性断连。连接/接收超时改为：
+        #   握手指令 -> ws_connect(timeout=10)；消息接收 -> receive_timeout=60
+        #   init_room 的 HTTP 请求 -> 逐请求 total=15
         async with aiohttp.ClientSession() as session:
             client = BLiveClient(room_id, session)
             client.handler = handle_danmaku
             await client.run(stop_event=shutdown_event)
     finally:
-        # 清理时取消所有任务
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
-
         worker_task.cancel()
         try:
             await worker_task
         except asyncio.CancelledError:
             pass
+        # 非阻塞关闭线程池：正常场景线程很快自行结束；
+        # 阻塞中的 connect 由进程退出兜底，避免等待挂死
+        ipc_executor.shutdown(wait=False, cancel_futures=True)
         writer.close()
         logger.info("Live 模式已退出")
 
@@ -634,8 +674,20 @@ if __name__ == "__main__":
     live_parser.add_argument("duration", type=float, help="弹幕滚动时长（秒）")
     live_parser.add_argument("--width", type=int, default=1920, help="视频宽度")
     live_parser.add_argument("--height", type=int, default=1080, help="视频高度")
+    live_parser.add_argument(
+        "-v", "--verbose", action="store_true", help="输出 DEBUG 级日志（或设置环境变量 BILIVER_DEBUG=1）"
+    )
 
     args = parser.parse_args()
+
+    if os.environ.get("BILIVER_DEBUG"):
+        args.verbose = True
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        _setup_console_handler(logging.DEBUG)
+    else:
+        # 默认在 mpv 控制台输出 WARNING+（重连/IPC 失败等关键事件），方便排查
+        _setup_console_handler(logging.WARNING)
 
     if args.mode == "vod":
         run_vod(
